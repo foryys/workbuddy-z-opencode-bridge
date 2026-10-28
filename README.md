@@ -1,5 +1,7 @@
 # OpenCode Go 桥接
 
+[![License: CC BY-NC-SA 4.0](https://img.shields.io/badge/License-CC_BY--NC--SA_4.0-blue)](LICENSE)
+
 让 **WorkBuddy** 客户端能用上 **OpenCode Go** 订阅里的模型。
 
 一个单文件 Node 代理，无第三方依赖。它解决的问题很小：客户端只让你填三格，而 OpenCode Go 非要一个请求头。
