@@ -1,0 +1,116 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 560" width="1000" height="560" role="img" aria-label="OpenCode Go 桥接代理的数据流">
+  <title>请求怎么走：WorkBuddy → 本机代理 → OpenCode Go</title>
+  <desc>客户端只能填三项，缺请求头入口；本机代理补上 x-opencode-session 再转发。代理另做会话身份派生、标题查询、思考内容存档与失败转储，全部留在本机。</desc>
+
+  <defs>
+    <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#94A3B8"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="1000" height="560" fill="#FFFFFF"/>
+
+  <!-- 主链路 -->
+  <line x1="240" y1="190" x2="284" y2="190" stroke="#CBD5E1" stroke-width="2" marker-end="url(#ar)"/>
+  <line x1="714" y1="190" x2="754" y2="190" stroke="#CBD5E1" stroke-width="2" marker-end="url(#ar)"/>
+
+  <!-- A 客户端 -->
+  <rect x="40" y="110" width="200" height="170" rx="10" fill="#F8FAFC" stroke="#CBD5E1"/>
+  <text x="56" y="140" font-family="PingFang SC, Microsoft YaHei, sans-serif" font-size="13" font-weight="700" fill="#0F172A">WorkBuddy 客户端</text>
+  <text x="56" y="164" font-family="PingFang SC, Microsoft YaHei, sans-serif" font-size="10.5" fill="#475569">自定义模型只有三格可填</text>
+  <g font-family="PingFang SC, Microsoft YaHei, sans-serif" font-size="10.5" fill="#334155">
+    <text x="56" y="186">· 接口地址</text>
+    <text x="56" y="204">· API Key</text>
+    <text x="56" y="222">· 模型名称</text>
+  </g>
+  <rect x="56" y="234" width="168" height="30" rx="6" fill="#FEF2F2" stroke="#FECACA"/>
+  <text x="66" y="253" font-family="PingFang SC, Microsoft YaHei, sans-serif" font-size="10.5" fill="#B91C1C">没有填请求头的入口</text>
+
+  <!-- B 代理 -->
+  <rect x="290" y="70" width="420" height="250" rx="10" fill="#EFF6FF" stroke="#93C5FD"/>
+  <text x="306" y="92" font-family="PingFang SC, Microsoft YaHei, sans-serif" font-size="13" font-weight="700" fill="#1D4ED8">本机代理 · 127.0.0.1:8787</text>
+
+  <rect x="306" y="104" width="388" height="50" rx="8" fill="#FFFFFF" stroke="#BFDBFE"/>
+  <text x="318" y="124" font-family="PingFang SC, Microsoft YaHei, sans-serif" font-size="11.5" font-weight="700" fill="#0F172A">① 补一个请求头</text>
+  <text x="318" y="142" font-family="PingFang SC, Microsoft YaHei, sans-serif" font-size="10" fill="#475569">x-opencode-session —— 缺它，上游在鉴权前就 400</text>
+
+  <rect x="306" y="162" width="388" height="50" rx="8" fill="#FFFFFF" stroke="#BFDBFE"/>
+  <text x="318" y="182" font-family="PingFang SC, Microsoft YaHei, sans-serif" font-size="11.5" font-weight="700" fill="#0F172A">② 定会话身份</text>
+  <text x="318" y="200" font-family="PingFang SC, Microsoft YaHei, sans-serif" font-size="10" fill="#475569">按首条消息派生，多任务互不撞车；标题查本地库（只读）</text>
+
+  <rect x="306" y="220" width="388" height="50" rx="8" fill="#FFFFFF" stroke="#BFDBFE"/>
+  <text x="318" y="240" font-family="PingFang SC, Microsoft YaHei, sans-serif" font-size="11.5" font-weight="700" fill="#0F172A">③ 补齐思考字段</text>
+  <text x="318" y="258" font-family="PingFang SC, Microsoft YaHei, sans-serif" font-size="10" fill="#475569">reasoning_content 缺一条整条被拒，按正文存档补回</text>
+
+  <text x="306" y="294" font-family="PingFang SC, Microsoft YaHei, sans-serif" font-size="10" fill="#1E40AF">出站：直连 ／ 经本地 HTTP 代理隧道（启动时探测一次，通才用）</text>
+  <text x="306" y="310" font-family="PingFang SC, Microsoft YaHei, sans-serif" font-size="10" fill="#1E40AF">KEEP-ALIVE 复用连接，不每个请求重开隧道</text>
+
+  <!-- C 上游 -->
+  <rect x="760" y="110" width="200" height="170" rx="10" fill="#F8FAFC" stroke="#CBD5E1"/>
+  <text x="776" y="140" font-family="PingFang SC, Microsoft YaHei, sans-serif" font-size="13" font-weight="700" fill="#0F172A">OpenCode Go</text>
+  <text x="776" y="160" font-family="PingFang SC, Microsoft YaHei, sans-serif" font-size="10" fill="#64748B">/inference/go</text>
+  <g font-family="PingFang SC, Microsoft YaHei, sans-serif" font-size="10.5" fill="#334155">
+    <text x="776" y="188">认得那个请求头</text>
+    <text x="776" y="208">认得你的 API Key</text>
+  </g>
+  <text x="776" y="238" font-family="PingFang SC, Microsoft YaHei, sans-serif" font-size="10" fill="#64748B">模型 id 填裸名，</text>
+  <text x="776" y="254" font-family="PingFang SC, Microsoft YaHei, sans-serif" font-size="10" fill="#64748B">不加 opencode-go/ 前缀</text>
+
+  <!-- 下方三块：都在本机 -->
+  <text x="40" y="366" font-family="PingFang SC, Microsoft YaHei, sans-serif" font-size="11.5" font-weight="700" fill="#0F172A">留在本机的三样东西</text>
+
+  <rect x="40" y="380" width="290" height="100" rx="10" fill="#FFFFFF" stroke="#E2E8F0"/>
+  <text x="54" y="404" font-family="PingFang SC, Microsoft YaHei, sans-serif" font-size="11.5" font-weight="700" fill="#0F172A">终端看板</text>
+  <g font-family="PingFang SC, Microsoft YaHei, sans-serif" font-size="10.5" fill="#475569">
+    <text x="54" y="426">状态灯 · 在等上游的任务与已等秒数</text>
+    <text x="54" y="444">列宽按中文两格算，竖线落在同一列</text>
+    <text x="54" y="462">窗口标题带版本号</text>
+  </g>
+
+  <rect x="350" y="380" width="290" height="100" rx="10" fill="#FFFFFF" stroke="#E2E8F0"/>
+  <text x="364" y="404" font-family="PingFang SC, Microsoft YaHei, sans-serif" font-size="11.5" font-weight="700" fill="#0F172A">浏览器看板</text>
+  <g font-family="PingFang SC, Microsoft YaHei, sans-serif" font-size="10.5" fill="#475569">
+    <text x="364" y="426">打开 http://127.0.0.1:8787/</text>
+    <text x="364" y="444">成 / 败 / 出站方式 / 思考存档条数</text>
+    <text x="364" y="462">只监本机，局域网与公网都进不来</text>
+  </g>
+
+  <rect x="660" y="380" width="300" height="100" rx="10" fill="#FFFFFF" stroke="#E2E8F0"/>
+  <text x="674" y="404" font-family="PingFang SC, Microsoft YaHei, sans-serif" font-size="11.5" font-weight="700" fill="#0F172A">两个本地存档</text>
+  <g font-family="PingFang SC, Microsoft YaHei, sans-serif" font-size="10.5" fill="#475569">
+    <text x="674" y="426">reasoning-cache.json —— 思考内容，跨重启</text>
+    <text x="674" y="444">proxy-fail-*.json —— 上游 400 的原始请求体</text>
+    <text x="674" y="462">都在同目录，已列入 .gitignore</text>
+  </g>
+
+  <text x="500" y="518" text-anchor="middle" font-family="PingFang SC, Microsoft YaHei, sans-serif" font-size="10.5" fill="#64748B">日志只记状态码、路径、耗时和 session 前 8 位 —— 不记 Key，不外发任何内容</text>
+
+  <!-- 动画：请求去 / 响应回 -->
+  <g>
+    <circle cx="240" cy="190" r="5" fill="#2563EB" opacity="0">
+      <animate attributeName="cx" values="240;754" dur="3.2s" begin="0s" repeatCount="indefinite"/>
+      <animate attributeName="opacity" values="0;1;1;0" keyTimes="0;0.06;0.9;1" dur="3.2s" begin="0s" repeatCount="indefinite"/>
+    </circle>
+    <circle cx="240" cy="190" r="5" fill="#2563EB" opacity="0">
+      <animate attributeName="cx" values="240;754" dur="3.2s" begin="1.6s" repeatCount="indefinite"/>
+      <animate attributeName="opacity" values="0;1;1;0" keyTimes="0;0.06;0.9;1" dur="3.2s" begin="1.6s" repeatCount="indefinite"/>
+    </circle>
+    <circle cx="754" cy="206" r="4" fill="#0D9488" opacity="0">
+      <animate attributeName="cx" values="754;240" dur="3.2s" begin="0.8s" repeatCount="indefinite"/>
+      <animate attributeName="opacity" values="0;1;1;0" keyTimes="0;0.06;0.9;1" dur="3.2s" begin="0.8s" repeatCount="indefinite"/>
+    </circle>
+  </g>
+
+  <!-- 代理内三步依次亮 -->
+  <g fill="none" stroke="#2563EB" stroke-width="1.8">
+    <rect x="306" y="104" width="388" height="50" rx="8" opacity="0">
+      <animate attributeName="opacity" values="0;0.95;0.95;0;0" keyTimes="0;0.04;0.22;0.3;1" dur="6s" begin="0s" repeatCount="indefinite"/>
+    </rect>
+    <rect x="306" y="162" width="388" height="50" rx="8" opacity="0">
+      <animate attributeName="opacity" values="0;0.95;0.95;0;0" keyTimes="0;0.04;0.22;0.3;1" dur="6s" begin="1.8s" repeatCount="indefinite"/>
+    </rect>
+    <rect x="306" y="220" width="388" height="50" rx="8" opacity="0">
+      <animate attributeName="opacity" values="0;0.95;0.95;0;0" keyTimes="0;0.04;0.22;0.3;1" dur="6s" begin="3.6s" repeatCount="indefinite"/>
+    </rect>
+  </g>
+</svg>

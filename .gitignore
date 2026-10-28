@@ -1,0 +1,6 @@
+proxy.log
+proxy.log.1
+proxy-fail-*.json
+reasoning-cache.json
+reasoning-cache.json.tmp
+*.log
