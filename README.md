@@ -35,9 +35,9 @@ WorkBuddy 的「自定义模型」只有三个输入框：**接口地址、API K
 
 ## 请求怎么走
 
-蓝点是请求，青点是响应。代理除补头之外还做三件事，都在本机完成：定会话身份（多个对话不挤到同一条上游会话）、补思考字段（DeepSeek 思考模式缺 `reasoning_content` 会整条被拒）、留一份失败转储方便排查。
+<img src="docs/architecture.svg" alt="数据流：WorkBuddy → 本机代理 127.0.0.1:8787 → OpenCode Go" width="100%">
 
-数据流图见 [`docs/architecture.svg`](docs/architecture.svg)。
+蓝点是请求，青点是响应。代理除补头之外还做三件事，都在本机完成：定会话身份（多个对话不挤到同一条上游会话）、补思考字段（DeepSeek 思考模式缺 `reasoning_content` 会整条被拒）、留一份失败转储方便排查。
 
 ## 安装
 
@@ -109,7 +109,7 @@ opencode-go-proxy.mjs   代理主体，单文件
 启动代理.cmd            双击启动（简版）
 start-proxy.cmd         启动（带端口占用检查与 node 三级查找）
 说明.md                 原始中文说明，含更细的排错
-docs/architecture.svg   数据流图
+docs/architecture.svg   上面那张图
 ```
 
 ## 日志不进库
