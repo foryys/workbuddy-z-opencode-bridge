@@ -2,12 +2,12 @@
 /**
  * OpenCode Go → WorkBuddy 桥接代理 v4
  *
- * v3 → v4 的唯一改动：出站走本地 HTTP 代理。
+ * v3 → v4 的唯一改动：出站走本地代理（VPN）。
  *
  * 为什么必须改：Node 的 http.request 不读系统代理设置，v3 一直直连 opencode.ai。
  * 实测同一条线路——
- *   直连（普通家宽 → Cloudflare）：ttfb 0.78 / 1.65 / 2.44s，TLS 抖动到 2.1s
- *   经本地 HTTP 代理(127.0.0.1:7890)：ttfb 0.77 / 0.76 / 0.90s
+ *   直连（国内宽带 → Cloudflare）：ttfb 0.78 / 1.65 / 2.44s，TLS 抖动到 2.1s
+ *   经本地代理(127.0.0.1:7890 → 境外中转)：ttfb 0.77 / 0.76 / 0.90s
  * 直连的抖动正是「并发两个任务就报网络错误」「长任务经常断」的来源。
  *
  * v4 用 HTTP CONNECT 把上游连接穿透到本地代理，并在 Agent 层做 keep-alive 复用，
@@ -31,12 +31,104 @@ import net from 'node:net';
 import { Agent as HttpAgent } from 'node:http';
 import { Agent as HttpsAgent } from 'node:https';
 import { randomUUID, createHash } from 'node:crypto';
-import { URL } from 'node:url';
+import { URL, fileURLToPath } from 'node:url';
 import { Transform } from 'node:stream';
 import zlib from 'node:zlib';
 import path from 'node:path';
 import os from 'node:os';
 import { createWriteStream, writeFileSync, readFileSync, statSync, renameSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+
+// ── Windows 控制台代码页 ─────────────────────────────────────────────────────
+// 新开的 cmd 窗口默认 936，而本程序所有中文都是 UTF-8 字节，不切代码页必然花屏。
+// 启动即切 65001，退出时（含异常退出）还原成进入前的值——调用方 service.cmd 是 GBK
+// 编码的批处理，若不还原，它后面那些 echo 会全部乱掉。
+const CONSOLE_CP = (() => {
+  if (process.platform !== 'win32') return null;
+  const read = () => {
+    try {
+      const out = String(execFileSync('cmd', ['/c', 'chcp'], { encoding: 'latin1', windowsHide: true, timeout: 3000 }));
+      const m = out.match(/(\d{3,5})/);
+      return m ? m[1] : '936';
+    } catch { return '936'; }
+  };
+  const set = (cp) => {
+    try { execFileSync('cmd', ['/c', 'chcp', cp], { stdio: 'ignore', windowsHide: true, timeout: 3000 }); } catch { /* 无控制台时失败无妨 */ }
+  };
+  const before = read();
+  if (before !== '65001') set('65001');
+  return { before, restore: () => set(before) };
+})();
+if (CONSOLE_CP) process.on('exit', () => CONSOLE_CP.restore());
+
+// ── 一次性状态查询：`node opencode-go-proxy.mjs status` ───────────────────────
+// 网页看板已砍（2026-10-28），状态只在终端看。这条命令不启动服务、不碰日志文件，
+// 只去问正在跑的那个实例要 /status，把答案画成一屏就退出。双击桌面那个 cmd 走的就是它。
+if (process.argv[2] === 'status') {
+  const port = Number(process.env.PORT || 8787);
+  const S = { reset: '\x1b[0m', dim: '\x1b[2m', bold: '\x1b[1m', green: '\x1b[32m', red: '\x1b[31m', yellow: '\x1b[33m', cyan: '\x1b[36m', gray: '\x1b[90m', bgBlue: '\x1b[44m', white: '\x1b[97m' };
+  const dw = (s) => { let w = 0; for (const ch of s) w += /[\u1100-\u115F\u2E80-\uA4CF\uAC00-\uD7A3\uF900-\uFAFF\uFE30-\uFE6F\uFF00-\uFF60\uFFE0-\uFFE6]/.test(ch) ? 2 : 1; return w; };
+  const padTo = (s, n) => s + ' '.repeat(Math.max(0, n - dw(s)));
+  const cut = (s, n) => { if (dw(s) <= n) return s; let o = '', w = 0; for (const ch of s) { const c = dw(ch); if (w + c > n - 1) break; o += ch; w += c; } return o + '…'; };
+  const hhmmss = (t) => { const d = new Date(t), p = (n) => (n < 10 ? '0' : '') + n; return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds()); };
+  let s;
+  try {
+    const r = await fetch(`http://127.0.0.1:${port}/status`, { cache: 'no-store' });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    s = await r.json();
+  } catch (e) {
+    console.log(`${S.bgBlue}${S.white}${S.bold} OpenCode Go 启动器 ${S.reset} ${S.red}${S.bold}● 没在跑${S.reset}`);
+    console.log(`${S.gray}${'─'.repeat(72)}${S.reset}`);
+    console.log(` 端口 ${port} 上没有应答（${e.message}）。客户端里那条模型现在发不出去。`);
+    console.log(` 双击桌面「OpenCode Go 启动器」（托盘图标）就会把它拉起来。`);
+    process.exit(1);
+  }
+  const now = Date.now(), lastAt = s.lastAt || 0, idle = lastAt ? now - lastAt : Infinity;
+  const lastEv = s.recent && s.recent[0];
+  const lastBad = lastEv && !(lastEv.status >= 200 && lastEv.status < 300) && !lastEv.aborted;
+  const act = s.active || [];
+  let dot, txt;
+  if (act.length) { dot = S.green + S.bold; txt = '● 运行中'; }
+  else if (!lastAt) { dot = S.gray; txt = '● 等待请求'; }
+  else if (lastBad) { dot = S.red + S.bold; txt = '● 最近一次失败'; }
+  else if (idle < 95000) { dot = S.green + S.bold; txt = '● 运行中'; }
+  else { dot = S.gray; txt = '● 空闲'; }
+  const brand = `${S.bgBlue}${S.white}${S.bold} OpenCode Go 启动器 ${S.reset} ${S.cyan}${S.bold}v${s.version}${S.reset}`;
+  const W = 72;
+  console.log(brand + ' '.repeat(Math.max(1, W - dw(' OpenCode Go 启动器 ') - dw('v' + s.version) - dw(txt))) + dot + txt + S.reset);
+  console.log(S.gray + '─'.repeat(W) + S.reset);
+  const ob = s.outbound === 'direct' ? '直连' : '经代理 ' + s.proxy;
+  console.log(` 出站     ${s.outbound === 'direct' ? S.yellow : S.green}${ob}${S.reset}` + ' '.repeat(Math.max(1, 30 - dw(ob))) + ` 成功 ${S.green}${s.ok}${S.reset} / ${s.total}   失败 ${s.fail ? S.red + s.fail : '0'}${S.reset}`);
+  const upPlain = `${Math.round(s.uptimeMs / 60000)} 分钟`;
+  console.log(` 已运行   ${upPlain}` + ' '.repeat(Math.max(1, 30 - dw(upPlain))) + ` 最近请求 ${lastAt ? Math.round(idle / 1000) + ' 秒前' : '还没收到'}   并发 ${act.length}`);
+  if (act.length) {
+    console.log(` 进行中   ` + act.slice(0, 3).map((a) => {
+      const sec = Math.round(a.elapsedMs / 1000);
+      const col = sec > 300 ? S.red + S.bold : (sec > 120 ? S.yellow : S.green);
+      return `${S.cyan}${cut(a.label || a.sid, 22)}${S.reset} ${col}${sec} 秒${sec > 300 ? ' 可能卡住' : ''}${S.reset}`;
+    }).join(S.gray + '  ·  ' + S.reset));
+  }
+  console.log(S.gray + '─'.repeat(W) + S.reset);
+  console.log(S.gray + '  ' + padTo('任务', 24) + padTo('时间', 10) + padTo('耗时', 10) + '结果' + S.reset);
+  for (const e of (s.recent || []).slice(0, 12)) {
+    const good = e.status >= 200 && e.status < 300;
+    const res = good ? '成功' : (e.aborted ? '中断' : '失败');
+    const bits = [];
+    if (e.status) bits.push('HTTP ' + e.status);
+    if (e.injected) bits.push('补思考 ' + e.injected);
+    if (e.why && !e.aborted) bits.push(e.why);
+    if (e.aborted) bits.push('客户端断开');
+    console.log('  ' + S.cyan + padTo(cut(e.label || e.session || '', 24), 24) + S.reset
+      + S.gray + padTo(hhmmss(e.at), 10) + S.reset
+      + padTo((e.ms / 1000).toFixed(1) + ' 秒', 10)
+      + (good ? S.green : (e.aborted ? S.yellow : S.red)) + res + S.reset + '  '
+      + S.gray + cut(bits.join('  '), 20) + S.reset);
+  }
+  if (!(s.recent || []).length) console.log(S.gray + '  还没有请求。在 WorkBuddy 里发一条消息试试。' + S.reset);
+  console.log(S.gray + '─'.repeat(W) + S.reset);
+  console.log(S.gray + ` 日志：proxy.log　·　状态源：http://127.0.0.1:${port}/status` + S.reset);
+  process.exit(0);
+}
 
 // 日志同时落盘：启动器窗口一关，屏幕上的一切就没了，出问题只能靠猜。
 // 位置默认是同目录 proxy.log，超过 5MB 在下次启动时改名留一份。
@@ -62,8 +154,20 @@ console.error = (...a) => emit(_err, a);
 
 const PORT = Number(process.env.PORT || 8787);
 const HOST = '127.0.0.1';
-const UPSTREAM = (process.env.UPSTREAM_BASE || 'https://opencode.ai/inference/go').replace(/\/+$/, '');
+
+// 同目录的 config.json 是控制台（tui.py）写的，环境变量优先。
+// 这里只读两个不敏感字段：上游地址、本地令牌。真钥匙是 DPAPI 密文，
+// 只有 Python 那边解得开，靠环境变量传进来。
+const CFG = (() => {
+  try {
+    const dir = path.dirname(fileURLToPath(import.meta.url));
+    return JSON.parse(readFileSync(path.join(dir, 'config.json'), 'utf8'));
+  } catch { return {}; }
+})();
+const UPSTREAM = (process.env.UPSTREAM_BASE || CFG.upstream || 'https://opencode.ai/inference/go').replace(/\/+$/, '');
 const ENV_KEY = process.env.OPENCODE_API_KEY || '';
+// 客户端填的"本地令牌"：代理收到它就换成真钥匙，真钥匙因此不必写进客户端配置。
+const LOCAL_TOKEN = (process.env.PROXY_TOKEN || CFG.local_key || '').trim();
 const RETRIES = Number(process.env.PROXY_RETRIES ?? 3);
 const CONNECT_TIMEOUT = Number(process.env.CONNECT_TIMEOUT_MS || 30000);
 const IDLE_TIMEOUT = Number(process.env.IDLE_TIMEOUT_MS || 0);
@@ -137,7 +241,7 @@ function logFallback(msg) {
   if (fallbackLogged) return;
   fallbackLogged = true;
   console.log(`[warn] 出站代理不可用，已回退直连：${msg}`);
-  console.log('[warn] 直连时长链路抖动会明显变大；需要走代理请确认代理端口（默认 7890）已开启。');
+  console.log('[warn] 直连时跨境抖动会明显变大；需要走 VPN 请确认代理端口（默认 7890）已开启。');
 }
 
 // 经本地 HTTP 代理建立 CONNECT 隧道，返回裸 socket
@@ -215,10 +319,17 @@ function buildHeaders(incoming) {
     if (k.startsWith('__')) continue;               // 内部标记，绝不外发
     if (!HOP_BY_HOP.has(k.toLowerCase())) out[k] = v;
   }
-  if (!out['authorization'] && ENV_KEY) out['authorization'] = `Bearer ${ENV_KEY}`;
+  const auth = out['authorization'] || '';
+  if (LOCAL_TOKEN && auth === `Bearer ${LOCAL_TOKEN}`) {
+    // 客户端拿的是本地令牌，不是真钥匙——在这里换掉。
+    // 真钥匙因此只存在于这个进程的内存和加密配置文件里。
+    if (ENV_KEY) out['authorization'] = `Bearer ${ENV_KEY}`;
+  } else if (!auth && ENV_KEY) {
+    out['authorization'] = `Bearer ${ENV_KEY}`;
+  }
   if (incoming.__gzip) out['content-encoding'] = 'gzip';
   out['x-opencode-session'] = sessionFor(incoming);
-  out['user-agent'] = 'workbuddy-opencode-go-proxy/4.5';
+  out['user-agent'] = 'workbuddy-opencode-go-proxy/4.9';
   out['accept-encoding'] = 'identity';
   delete out['x-wb-session'];
   return out;
@@ -267,7 +378,7 @@ function deriveSessionInfo(body) {
       return cn / v.length >= 0.5;      // 一半以上是汉字才算"人话"
     };
     let label = '';
-    // 1) 会话标题格式：YYYYMMDD|主题|简称
+    // 1) 会话起名的格式：20260101|示例|说明版改版
     for (const m of msgs) {
       if (!m) continue;
       const hit = clean(textOf(m.content)).match(/\d{8}\|[^\s|]{1,8}\|[^\s|]{1,12}/);
@@ -573,7 +684,7 @@ const sessionLabels = new Map();   // 会话身份 -> 人看得懂的标签
 // 控制台日志是一直流下去的，人眼很难判断"现在到底有没有在跑"。这里留一份最近状态，
 // 浏览器打开 http://127.0.0.1:8787/ 就能一眼看完。
 const STARTED_AT = Date.now();
-const VERSION = '4.5';
+const VERSION = '4.9';
 const RECENT_MAX = 200;
 const recent = [];
 const stat = { total: 0, ok: 0, fail: 0, repaired: 0, filled: 0 };
@@ -854,109 +965,18 @@ async function relay(req, res, body) {
   }
 }
 
-const DASHBOARD_HTML = `<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8">
-<title>OpenCode Go 启动器 · 状态</title>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<style>
-  :root{--blue:#0F38F6;--ok:#16a34a;--bad:#dc2626;--warn:#d97706;--ink:#111827;--gray:#6b7280;--line:#e5e7eb}
-  *{box-sizing:border-box}
-  body{margin:0;padding:24px;background:#f7f8fa;color:var(--ink);
-       font:14px/1.6 "Microsoft YaHei","PingFang SC",system-ui,sans-serif}
-  h1{font-size:18px;margin:0}
-  .head{display:flex;align-items:center;justify-content:space-between;margin-bottom:18px}
-  .pill{padding:6px 14px;border-radius:999px;font-weight:600;font-size:14px;color:#fff}
-  .cards{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:18px}
-  .card{background:#fff;border:1px solid var(--line);border-radius:12px;padding:14px 16px}
-  .card .k{color:var(--gray);font-size:12px}
-  .card .v{font-size:22px;font-weight:700;margin-top:4px;font-variant-numeric:tabular-nums}
-  .hint{background:#fff;border:1px solid var(--line);border-radius:12px;padding:10px 16px;margin-bottom:14px;color:var(--gray)}
-  table{width:100%;border-collapse:collapse;background:#fff;border:1px solid var(--line);border-radius:12px;overflow:hidden}
-  th,td{padding:8px 12px;text-align:left;border-bottom:1px solid var(--line);font-size:13px}
-  th{background:#fafafa;color:var(--gray);font-weight:600}
-  tr:last-child td{border-bottom:none}
-  .ok{color:var(--ok);font-weight:600}.bad{color:var(--bad);font-weight:600}.mid{color:var(--warn)}
-  .num{font-variant-numeric:tabular-nums}
-  .faint{color:var(--gray)}
-</style></head><body>
-<div class="head">
-  <h1>OpenCode Go 启动器 · 状态</h1>
-  <div id="pill" class="pill" style="background:#9ca3af">读取中</div>
-</div>
-<div class="cards">
-  <div class="card"><div class="k">出站方式</div><div class="v" id="outbound">-</div></div>
-  <div class="card"><div class="k">成功 / 累计</div><div class="v" id="okCount">-</div></div>
-  <div class="card"><div class="k">失败</div><div class="v" id="failCount">-</div></div>
-  <div class="card"><div class="k">补回的思考内容</div><div class="v" id="repair">-</div></div>
-</div>
-<div class="hint" id="hint">-</div>
-<table>
-  <thead><tr><th>时间</th><th>耗时</th><th>结果</th><th>备注</th></tr></thead>
-  <tbody id="rows"><tr><td colspan="4" class="faint">暂无请求</td></tr></tbody>
-</table>
-<script>
-function ago(ms){
-  var s = Math.round(ms/1000);
-  if (s < 60) return s + ' 秒前';
-  if (s < 3600) return Math.round(s/60) + ' 分钟前';
-  return Math.round(s/3600) + ' 小时前';
-}
-function hhmmss(t){
-  var d = new Date(t), p = function(n){ return (n<10?'0':'')+n; };
-  return p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds());
-}
-async function tick(){
-  try{
-    var s = await (await fetch('/status', {cache:'no-store'})).json();
-    var now = Date.now();
-    var lastAt = s.lastAt || 0;
-    var idle = lastAt ? now - lastAt : 1e9;
-    var lastFailed = s.recent.length && s.recent[0].status && (s.recent[0].status < 200 || s.recent[0].status >= 300);
-    var pill = document.getElementById('pill');
-    if (!lastAt){ pill.textContent = '还没收到请求'; pill.style.background = '#9ca3af'; }
-    else if (lastFailed){ pill.textContent = '最近一次失败'; pill.style.background = 'var(--bad)'; }
-    else if (idle < 95000){ pill.textContent = '运行中'; pill.style.background = 'var(--ok)'; }
-    else { pill.textContent = '空闲'; pill.style.background = '#9ca3af'; }
-
-    document.getElementById('outbound').textContent = s.outbound === 'direct' ? '直连' : ('经代理 ' + s.proxy);
-    document.getElementById('outbound').style.color = s.outbound === 'direct' ? 'var(--warn)' : 'var(--ok)';
-    document.getElementById('okCount').textContent = s.ok + ' / ' + s.total;
-    document.getElementById('failCount').textContent = s.fail;
-    document.getElementById('failCount').style.color = s.fail ? 'var(--bad)' : 'var(--ink)';
-    document.getElementById('repair').textContent = s.repaired;
-    document.getElementById('hint').textContent = lastAt
-      ? '最近一次请求 ' + ago(idle) + '　·　已运行 ' + Math.round(s.uptimeMs/60000) + ' 分钟　·　版本 v' + s.version
-      : '还没收到任何请求。在 WorkBuddy 里发一条消息试试。';
-
-    var rows = s.recent.slice(0, 30).map(function(e){
-      var good = e.status >= 200 && e.status < 300;
-      var res = good ? '<span class="ok">成功</span>' : (e.aborted ? '<span class="mid">中断</span>' : '<span class="bad">失败</span>');
-      var note = [];
-      if (e.injected) note.push('补思考 ' + e.injected + ' 条');
-      if (e.why && !e.aborted) note.push(e.why);
-      if (e.aborted && e.why) note.push(e.why);
-      return '<tr><td class="num">' + hhmmss(e.at) + '</td><td class="num">' + (e.ms/1000).toFixed(1) + ' 秒</td><td>' + res +
-             '</td><td class="faint">' + (e.status ? 'HTTP ' + e.status + '　' : '') + note.join('　') + '</td></tr>';
-    }).join('');
-    document.getElementById('rows').innerHTML = rows || '<tr><td colspan="4" class="faint">暂无请求</td></tr>';
-  }catch(err){
-    document.getElementById('pill').textContent = '启动器没在跑';
-    document.getElementById('pill').style.background = 'var(--bad)';
-  }
-}
-tick(); setInterval(tick, 2000);
-</script></body></html>`;
-
 const server = http.createServer((req, res) => {
   if (req.url === '/' || req.url.startsWith('/?')) {
-    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-    return res.end(DASHBOARD_HTML);
+    // 网页看板已砍（2026-10-28 用户令）：状态只在终端看。这里只留一行指路，免得误点浏览器看到空白。
+    res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
+    return res.end('OpenCode Go 启动器在跑。状态 JSON：/status   健康检查：/healthz\n');
   }
   if (req.url === '/status') {
     const lastAt = recent.length ? recent[recent.length - 1].at : 0;
     res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
     return res.end(JSON.stringify({
       version: VERSION, uptimeMs: Date.now() - STARTED_AT,
+      hasKey: Boolean(ENV_KEY), localToken: Boolean(LOCAL_TOKEN),
       outbound: OUTBOUND_DIRECT ? 'direct' : 'proxy',
       proxy: PROXY ? `${PROXY.host}:${PROXY.port}` : '',
       upstream: UPSTREAM, total: stat.total, ok: stat.ok, fail: stat.fail,
@@ -971,6 +991,7 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, { 'content-type': 'application/json' });
     return res.end(JSON.stringify({
       ok: true, version: VERSION, upstream: UPSTREAM, hasKey: Boolean(ENV_KEY),
+      localToken: Boolean(LOCAL_TOKEN),
       outbound: OUTBOUND_DIRECT ? 'direct' : `proxy ${PROXY.host}:${PROXY.port}`,
       retries: RETRIES, idleTimeout: IDLE_TIMEOUT,
       connectTimeout: CONNECT_TIMEOUT, keepAliveTimeout: KEEPALIVE_TIMEOUT,
@@ -996,19 +1017,37 @@ server.timeout = 0;
     const alive = await probeProxy(PROXY.host, PROXY.port, 800);
     if (!alive) {
       console.log(`[warn] 出站代理 ${PROXY.host}:${PROXY.port} 连不上，本次直接走直连。`);
-      console.log('[warn] 能用，但长链路抖动会明显变大；想要稳，请先把网络代理开起来再重启代理。');
+      console.log('[warn] 能用，但跨境抖动会明显变大；想要稳，请先把网络代理开起来再重启我。');
       OUTBOUND_DIRECT = true;
     }
   }
   buildAgents(!OUTBOUND_DIRECT);
 
+  // 常驻模式下的看门狗：出站走哪条路，启动那一刻定的不算数。
+  // 挂着跑一整天，VPN 会中途起落；每分钟复核一次，状态真的翻了才换 agent 并记一笔，
+  // 不让"开机时 VPN 没起"变成一整天的直连抖动。PROXY_WATCHDOG=0 可关。
+  if (PROXY && process.env.PROXY_WATCHDOG !== '0') {
+    let last = null;
+    setInterval(async () => {
+      const alive = await probeProxy(PROXY.host, PROXY.port, 800);
+      if (last === null) { last = alive; return; }
+      if (alive === last) return;
+      last = alive;
+      OUTBOUND_DIRECT = !alive;
+      buildAgents(!OUTBOUND_DIRECT);
+      console.log(`[switch] 出站改走 ${alive ? '代理 ' + PROXY.host + ':' + PROXY.port : '直连'}`);
+      drawTui();
+    }, 60000);
+  }
+
   server.listen(PORT, HOST, () => {
-    console.log(`OpenCode Go proxy v4.5 -> ${UPSTREAM}`);
+    console.log(`OpenCode Go proxy v${VERSION} -> ${UPSTREAM}`);
     console.log(`listening http://${HOST}:${PORT}`);
     console.log(`outbound ${OUTBOUND_DIRECT ? 'DIRECT (no proxy)' : `via proxy ${PROXY.host}:${PROXY.port}`}`);
     console.log(`session  ${DEFAULT_SESSION}`);
     console.log(`retries ${RETRIES} | gzip ${GZIP ? 'ON' : 'off'} | connectTimeout ${CONNECT_TIMEOUT}ms | tlsBudget ${TLS_BUDGETS.join('/')}ms | idleTimeout ${IDLE_TIMEOUT || 'unlimited'} | keepAliveTimeout ${KEEPALIVE_TIMEOUT || 'unlimited'}`);
-    if (!ENV_KEY) console.log('提示：未设 OPENCODE_API_KEY，将透传 WorkBuddy 里填的 Key。');
+    if (!ENV_KEY) console.log('提示：没读到上游密钥。打开控制台按 [C] 填进去，保存后会自动重启。');
+    if (LOCAL_TOKEN) console.log('本地令牌已启用：客户端填本地令牌即可，真钥匙不会落到客户端。');
     startTui();
   });
 })();

@@ -1,6 +1,15 @@
+tray.log
+proxy-tray.out
 proxy.log
-proxy.log.1
 proxy-fail-*.json
+__pycache__/
+tui.hwnd
 reasoning-cache.json
-reasoning-cache.json.tmp
 *.log
+config.json
+icon-16x8.png
+
+# 快捷方式指向本机绝对路径，换台机器就没用
+*.lnk
+# 由 _make-icon.py 生成，不入库
+icon.ico
