@@ -42,8 +42,8 @@ WorkBuddy 的「自定义模型」只有三个输入框：**接口地址、API K
 需要 **Node.js 18+**（WorkBuddy 自带的 node 也能用，脚本会自己找）。
 
 ```bash
-git clone https://github.com/foryys/opencode-go-bridge.git
-cd opencode-go-bridge
+git clone https://github.com/foryys/workbuddy-z-opencode-bridge.git
+cd workbuddy-z-opencode-bridge
 ```
 
 Windows 双击 `启动代理.cmd`，会开一个终端窗口，显示：
