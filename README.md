@@ -174,3 +174,5 @@ docs/architecture.svg   上面那张数据流图
 **PolyForm Noncommercial License 1.0.0**。全文见 [LICENSE](LICENSE)。
 
 只授权非商业用途：个人出于研究、实验、学习、兴趣的使用，以及慈善组织、教育机构、公共研究机构、公共安全与卫生机构、环保组织、政府机构的使用。公司业务中的任何使用、转售、随商业产品或服务分发，都不在授权范围内，需要另行取得许可。
+
+Copyright (c) 2026 foryys。
