@@ -57,7 +57,9 @@ v4.9 从「一个 .mjs 文件加一个 .cmd」长成了一套要长期开机跑�
 
 ## 安装
 
-需要 **Node.js 18+**（WorkBuddy 自带的 node 也认，脚本会自己找）和 **Python 3.8+**（托盘、控制台、起停都靠它，只用标准库）。系统是 **Windows**。
+需要 **Node.js 18+**（WorkBuddy 自带的 node 也认，脚本会自己找）。
+托盘、控制台、起停这三个外壳另外还要 **Python 3.8+**（只用标准库）和 **Windows**；
+只要代理本体、不要外壳的话，别的系统直接 `node opencode-go-proxy.mjs` 就能跑。
 
 ```bash
 git clone https://github.com/foryys/workbuddy-z-opencode-bridge.git
@@ -159,7 +161,10 @@ docs/architecture.svg   上面那张数据流图
 
 ## 环境要求
 
-- **Windows**。托盘、DPAPI 加密、控制台窗口都用 Windows 接口，别的系统跑不了。
+- **代理本体不限系统**。`opencode-go-proxy.mjs` 是纯 Node，Linux、macOS 上直接
+  `node opencode-go-proxy.mjs` 就能跑。
+- **外壳限 Windows**。托盘、控制台窗口、DPAPI 加密钥匙这三样用 Windows 接口，
+  别的系统上没有。
 - **Node.js 18+**。18 以下用不了 `node:sqlite`，会话标题会退化为按正文猜，其余功能正常。
 - **Python 3.8+**，只用标准库。没有 Python 时代理照跑，但解不开加密的钥匙，只能透传客户端自带的钥匙。
 
