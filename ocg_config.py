@@ -432,8 +432,12 @@ def find_node():
         r'~\.workbuddy\binaries\node\versions\*\node.exe'))
     if cands:
         return sorted(cands)[-1]
-    for p in (r'C:\Program Files\nodejs\node.exe',
-              r'C:\Program Files (x86)\nodejs\node.exe'):
+    cands = []
+    for k in ('ProgramFiles', 'ProgramFiles(x86)'):
+        d = os.environ.get(k)
+        if d:
+            cands.append(os.path.join(d, 'nodejs', 'node.exe'))
+    for p in cands:
         if os.path.exists(p):
             return p
     return None

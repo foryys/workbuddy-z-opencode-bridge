@@ -1,6 +1,6 @@
 # OpenCode Go 桥接
 
-[![License: CC BY-NC-SA 4.0](https://img.shields.io/badge/License-CC_BY--NC--SA_4.0-blue)](LICENSE)
+[![License: PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/License-PolyForm_Noncommercial_1.0.0-blue)](LICENSE)
 
 让 **WorkBuddy** 客户端用上 **OpenCode Go** 订阅里的模型。
 
@@ -171,6 +171,6 @@ docs/architecture.svg   上面那张数据流图
 
 ## 许可证
 
-**署名—非商业性使用—相同方式共享 4.0**（CC BY-NC-SA 4.0）。全文见 [LICENSE](LICENSE)。
+**PolyForm Noncommercial License 1.0.0**。全文见 [LICENSE](LICENSE)。
 
-本项目用于协议学习、研究与个人自用，禁止商业转售。要商用请另外联系我。
+只授权非商业用途：个人出于研究、实验、学习、兴趣的使用，以及慈善组织、教育机构、公共研究机构、公共安全与卫生机构、环保组织、政府机构的使用。公司业务中的任何使用、转售、随商业产品或服务分发，都不在授权范围内，需要另行取得许可。
