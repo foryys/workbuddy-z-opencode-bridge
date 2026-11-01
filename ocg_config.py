@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
-"""OpenCode Go 的公共零件：配置存取、本机加密、剪贴板、开机自启、代理启停。
+"""OpenCode Go 的公共零件：配置存取、剪贴板、开机自启、代理启停。
 
 tray.py（托盘）和 tui.py（控制台）都从这里拿，避免两份逻辑各写一遍。
 
-密钥存放策略：
-  config.json 里只放 key_enc —— CryptProtectData 加过密的 Base64。
-  这把锁绑「当前 Windows 账号 + 当前机器」，换个账号或把文件拷到别的电脑都解不开。
-  代理进程需要的明文钥匙只通过环境变量传进去，不落盘。
+**本项目不保存任何密钥。**
+钥匙只存在 WorkBuddy 里，客户端每次请求带着 `Authorization` 头过来，
+代理原样转发。所以本项目手里没有可泄露的东西——密钥泄不泄露，不归本项目管。
+config.json 里只有上游地址、模型名、别名表、端口这几项。
 """
 
 import base64
@@ -33,7 +33,10 @@ BASE = 'http://127.0.0.1:%d' % PORT
 DEFAULT_UPSTREAM = 'https://opencode.ai/inference/go'
 PROXY = os.path.join(HERE, 'opencode-go-proxy.mjs')
 
-# ---------------------------------------------------------------- DPAPI
+# ---------------------------------------------------------------- DPAPI 解密
+# 只剩解密：只用于「用户从旧版本升上来」时剥掉历史密文。
+# 加密那半已删——本项目不再存任何密钥（钥匙归 WorkBuddy）。
+# 留到下一个大版本就可以整段去掉。
 kernel32 = ctypes.windll.kernel32
 crypt32 = ctypes.windll.crypt32
 
@@ -54,23 +57,12 @@ def _take(blob):
         kernel32.LocalFree(blob.pbData)
 
 
-def protect(text):
-    """明文 -> Base64 密文。失败返回空串，调用方要能接受。"""
-    if not text:
-        return ''
-    try:
-        src, _keep = _blob(text.encode('utf-8'))
-        out = DATA_BLOB()
-        ok = crypt32.CryptProtectData(ctypes.byref(src), None, None, None,
-                                      None, 0, ctypes.byref(out))
-        if not ok:
-            return ''
-        return base64.b64encode(_take(out)).decode('ascii')
-    except Exception:
-        return ''
-
-
 def unprotect(b64):
+    """旧版密文解密。只给「从旧版本升上来」时剥历史密文用。
+
+    新配置里不会再写密文。读不出来（换了账号/机器）返回空串，
+    调用方照常往下走，不当错误——反正本项目也不再依赖它。
+    """
     if not b64:
         return ''
     try:
@@ -87,26 +79,16 @@ def unprotect(b64):
 
 
 # ---------------------------------------------------------------- 配置
-def _new_token():
-    return 'sk-ocg-' + uuid.uuid4().hex[:32]
-
-
 def defaults():
     return {
         'upstream': DEFAULT_UPSTREAM,
         'model': 'deepseek-v4.1-flash',
-        'local_key': _new_token(),
-        'key_enc': '',
+        'model_aliases': {},
         'port': PORT,
     }
 
 
 def load():
-    """内存里的 cfg 用明文（要显示、要复制），落盘的永远是密文。
-
-    local_enc 解不开（换了机器或换了账号）就发一把新的本地令牌，
-    否则客户端拿着旧令牌来，代理认不出，看起来像"代理坏了"。
-    """
     cfg = defaults()
     raw = {}
     try:
@@ -116,63 +98,43 @@ def load():
         pass
     if isinstance(raw, dict):
         for k, v in raw.items():
-            if v is not None and k not in ('local_enc', 'local_key'):
+            if v is not None and k not in ('local_enc', 'local_key', 'key_enc'):
                 cfg[k] = v
-        if raw.get('local_enc'):
-            cfg['local_key'] = unprotect(raw['local_enc']) or _new_token()
-        elif raw.get('local_key'):          # 旧版明文，读进来，下次保存就转密文
-            cfg['local_key'] = raw['local_key']
-    if not cfg.get('local_key'):
-        cfg['local_key'] = _new_token()
     return cfg
 
 
 def save(cfg):
     """原子写：先写临时文件再替换，避免掉电时把配置写成半截。
 
-    两把钥匙都只存密文：
-      key_enc   —— 上游真钥匙（从 opencode 拿的），代理要用
-      local_enc —— 本地令牌（给 WorkBuddy 填的），本身就是"密码"
-    明文一个都不进文件。
+    只写这几项，**不写任何密钥**。旧版本留下的 key_enc / local_enc
+    会在这里自然消失——本项目不再持有密钥，也就没有可泄露的东西。
     """
     out = {}
     for k, v in cfg.items():
-        if k in ('local_key', 'local_enc'):
+        if k in ('local_key', 'local_enc', 'key_enc'):
             continue
         out[k] = v
-    lk = cfg.get('local_key') or ''
-    if not lk:
-        lk = _new_token()
-        cfg['local_key'] = lk
-    out['local_enc'] = protect(lk)
-    out['key_enc'] = cfg.get('key_enc') or ''
     tmp = CONFIG_PATH + '.tmp'
     with open(tmp, 'w', encoding='utf-8', newline='\n') as f:
         json.dump(out, f, ensure_ascii=False, indent=2)
     os.replace(tmp, CONFIG_PATH)
 
 
-def has_upstream(cfg):
-    return bool(cfg.get('key_enc'))
-
-
-def rekey(cfg):
-    """换一把新的本地令牌。随时可换，但换完老客户端会 401，要重新粘一次。"""
-    cfg['local_key'] = _new_token()
-    return cfg['local_key']
-
-
-def get_key(cfg):
-    return unprotect(cfg.get('key_enc', ''))
-
-
-def set_key(cfg, plain):
-    cfg['key_enc'] = protect(plain.strip()) if plain.strip() else ''
-    return cfg
+def stale_secrets(cfg=None):
+    """config.json 里还留着旧版本的密文吗。给「升级后清一次」用。"""
+    try:
+        with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+            raw = json.load(f)
+    except Exception:
+        return False
+    return bool(raw.get('key_enc') or raw.get('local_enc'))
 
 
 def mask(secret):
-    """sk-abcd…wxyz 这种形状，够认出是哪把钥匙，又不至于泄露。"""
+    """sk-abcd…wxyz 这种形状，够认出是哪把钥匙，又不至于泄露。
+
+    本项目已不存密钥，这个函数只留给「显示旧版本残留」和日志打码。
+    """
     if not secret:
         return '(未设置)'
     if len(secret) <= 12:
@@ -180,13 +142,32 @@ def mask(secret):
     return secret[:7] + '*' * 6 + secret[-4:]
 
 
-# ------------------------------------------------- 从 WorkBuddy 回收旧钥匙
-# 场景：WorkBuddy 里早就填过真钥匙，代理一直是「透传」在用它。
-# 后来 opencode 后台不再显示那把钥匙，用户手头拿不到，但机器上还留着一份。
-# 与其让他去重新申请，不如就地把它搬进加密配置——顺手也把明文从
-# WorkBuddy 的 models.json 里挪走。
-MODELS_JSON = os.path.join(os.path.expanduser('~'), '.workbuddy', 'models.json')
+# ------------------------------------------------- 与 WorkBuddy 的模型清单对接
+def wb_config_dir():
+    """WorkBuddy 的配置目录——跟客户端自己那套规则走，不写死。
+
+    为什么不能直接拼 `~/.workbuddy`：客户端认两个环境变量改这个目录。
+      1. WORKBUDDY_CONFIG_DIR / CODEBUDDY_CONFIG_DIR —— 整体挪到别处；
+      2. WORKBUDDY_INSTANCE_NUMBER=N —— 多开用，目录变成 `~/.workbuddy-N`。
+    走错目录的后果是静默的：条目写进去了、文件也变了，但客户端根本不读，
+    界面没反应、也不报错，只能靠人猜。所以这里必须与客户端同源。
+    注意「安装路径」跟这个无关：程序装哪个盘都行，配置永远在用户目录下。
+    """
+    for k in ('WORKBUDDY_CONFIG_DIR', 'CODEBUDDY_CONFIG_DIR'):
+        v = str(os.environ.get(k) or '').strip()
+        if v:
+            return v
+    n = str(os.environ.get('WORKBUDDY_INSTANCE_NUMBER') or '').strip()
+    # homedir 优先；个别环境没有 USERPROFILE，退回 HOME
+    home = os.path.expanduser('~') or os.environ.get('HOME') or ''
+    return os.path.join(home, '.workbuddy' + ('-' + n if n else ''))
+
+
+MODELS_JSON = os.path.join(wb_config_dir(), 'models.json')
 LOCAL_PREFIX = 'sk-ocg-'
+# 本机这条在 WorkBuddy 里的 id 后缀。要用它的原因是客户端按 id 去重：
+# 两条都填真名时下拉里只剩一条（显示名不同也救不回来，10-30 实测过）。
+SUFFIX = '-oc'
 
 
 def is_local_token(value):
@@ -213,72 +194,257 @@ def detect_proxy_entry():
     return None
 
 
-def import_from_workbuddy(cfg, force=False):
-    """把 WorkBuddy 里那把上游钥匙搬进 config.json（加密）。
+def legacy_secret_warning():
+    """旧版本在本机留过密文时，给一句提醒。
 
-    返回 (是否成功, 给人看的一句话)。
+    升上来的老用户 config.json 里可能还有 key_enc / local_enc。
+    本项目已不存密钥，下一次保存就会自然清掉；这里只是让他知道一声，
+    免得以为「我的钥匙被偷了/丢了」。
     """
-    it = detect_proxy_entry()
-    if not it:
-        return False, 'WorkBuddy 里没有指向 %d 端口的模型配置' % PORT
-    key = str(it.get('apiKey') or '').strip()
-    if not key:
-        return False, '那条模型配置里没有钥匙'
-    if is_local_token(key):
-        return False, 'WorkBuddy 用的已经是本地令牌，不需要导'
-    if cfg.get('key_enc') and not force:
-        return False, '已经存过上游密钥了，这次没覆盖'
-    set_key(cfg, key)
-    save(cfg)
-    return True, '已从 WorkBuddy 导入上游密钥并加密保存（%s）' % mask(key)
+    if not stale_secrets():
+        return ''
+    return '旧版本在本机存的密钥残留，已随本次保存清除（本项目不再存密钥）'
 
 
-def swap_workbuddy_token(cfg):
-    """把 models.json 里那把真钥匙换成软件发的本地令牌。
+# ------------------------------------------- 把本机代理那条写进 WorkBuddy（自动配置）
+# 为什么需要：客户端设置里那个「模型名称」框填的就是 id，没有单独填显示名的
+# 地方；而它按 id 去重，两条 id 一样，下拉里就只剩一条。手工做这件事要改 id、
+# 改名字、填地址、贴密钥四步，还得知道「保存时名字会被 id 冲掉」这个坑。
+# 这里一次做完，而且可以反复执行。
 
-    真钥匙从此只以密文存在 config.json，明文不再落在 WorkBuddy 的配置里。
-    改动前先备份；写回是原子替换。
+def _read_models():
+    """返回 (条目列表, 整个容器)。容器是 list 或含数组的 dict，写回时整份写。"""
+    with open(MODELS_JSON, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    if isinstance(data, list):
+        return data, data
+    if isinstance(data, dict):
+        for k in ('models', 'list', 'items'):
+            v = data.get(k)
+            if isinstance(v, list):
+                return v, data
+    raise ValueError('models.json 结构不认识（既不是数组，也没有 models 数组）')
+
+
+def _write_models(container):
+    """整份写回：先备份、写临时文件、原子替换。返回备份文件名（原来没文件则 None）。
+
+    备份名带序号避让：同一秒里连按两次 [W] 时，不加序号就会把第一次那份
+    「写之前的原始件」覆盖掉，等于没备份。
     """
-    it = detect_proxy_entry()
-    if not it:
-        return False, 'WorkBuddy 里没有指向 %d 端口的模型配置' % PORT
-    old = str(it.get('apiKey') or '').strip()
-    if is_local_token(old):
-        return False, 'WorkBuddy 用的已经是本地令牌了'
-    if not cfg.get('key_enc'):
-        return False, '先把上游密钥导入本机，否则换完就没人能换回来了'
-    try:
-        with open(MODELS_JSON, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-    except Exception as e:
-        return False, '读不到 models.json：%s' % e
-
-    stamp = time.strftime('%Y%m%d-%H%M%S')
-    bak = MODELS_JSON + '.bak-' + stamp
-    try:
+    bak = None
+    if os.path.exists(MODELS_JSON):
+        stamp = time.strftime('%Y%m%d-%H%M%S')
+        bak = MODELS_JSON + '.bak-' + stamp
+        k = 2
+        while os.path.exists(bak):
+            bak = '%s.bak-%s-%d' % (MODELS_JSON, stamp, k)
+            k += 1
         shutil.copy2(MODELS_JSON, bak)
-    except Exception as e:
-        return False, '备份失败，没敢动：%s' % e
-
-    token = cfg.get('local_key') or ''
-    hit = 0
-    for it2 in (data if isinstance(data, list) else data.get('models') or []):
-        if not isinstance(it2, dict):
-            continue
-        url = str(it2.get('url') or '')
-        if ('127.0.0.1:%d' % PORT) in url or ('localhost:%d' % PORT) in url:
-            it2['apiKey'] = token
-            hit += 1
-    if not hit:
-        return False, '没找到要替换的条目'
+    d = os.path.dirname(MODELS_JSON)
+    if d and not os.path.isdir(d):
+        os.makedirs(d, exist_ok=True)
     tmp = MODELS_JSON + '.tmp'
+    with open(tmp, 'w', encoding='utf-8', newline='\n') as f:
+        json.dump(container, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, MODELS_JSON)
+    return bak
+
+
+def local_base_url(cfg=None):
+    cfg = cfg or load()
+    return 'http://127.0.0.1:%d/v1' % int(cfg.get('port') or PORT)
+
+
+def is_our_url(url, cfg=None):
+    """这条配置是不是指向本机代理 —— 只认端口，不认名字。"""
+    cfg = cfg or load()
+    p = int(cfg.get('port') or PORT)
+    u = str(url or '')
+    return ('127.0.0.1:%d' % p) in u or ('localhost:%d' % p) in u
+
+
+def display_name(seed, tag='OC'):
+    """从同一个模型那条的显示名派生本机这条。
+
+    先去掉已有的 `OD · ` / `OC · ` 前缀再加回去，反复跑不会叠成
+    `OC · OC · …`。
+    """
+    s = str(seed or '').strip()
+    if ' · ' in s:
+        s = s.split(' · ', 1)[1].strip()
+    return ('%s · %s' % (tag, s)) if s else tag
+
+
+def choose_model_id(base, items, cfg=None):
+    """挑一个不与别人撞的 id：撞了就从 `-oc` 加到 `-oc2`、`-oc3`……
+
+    判据是「别的地址占了这个 id」，不是「这名字看着像我的」——只认 url。
+    id 撞了，请求会发错地方，而界面上两条都还在，最难查。
+    """
+    taken = {str(it.get('id') or '') for it in items
+             if isinstance(it, dict) and not is_our_url(it.get('url'), cfg)}
+    if base not in taken:
+        return base
+    cand = base + SUFFIX
+    k = 2
+    while cand in taken:
+        cand = '%s%s%d' % (base, SUFFIX, k)
+        k += 1
+    return cand
+
+
+def ensure_workbuddy_entry(cfg=None):
+    """往 WorkBuddy 的模型清单里写（或修正）本机代理那一条。
+
+    返回 (是否有改动, 给人看的一句话)。三条自我约束：
+      1. 只动指向本机端口的那一条，别人的条目一字不改；
+      2. id 被占就自动加后缀避让，并把同一份映射写进 model_aliases ——
+         两边同源，才不会出现「客户端叫 A、代理只认 B」；
+      3. 写前备份、写后回读，对不上立刻还原。
+    幂等：已经是对的就一次都不写文件。
+    """
+    cfg = cfg or load()
+
+    base = str(cfg.get('model') or '').strip() or 'deepseek-v4.1-flash'
+    ours_url = local_base_url(cfg)
+
     try:
-        with open(tmp, 'w', encoding='utf-8', newline='\n') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, MODELS_JSON)
+        items, box = _read_models()
+    except FileNotFoundError:
+        if not os.path.isdir(wb_config_dir()):
+            # 客户端还没跑过，配置目录都不在。这时候建一个空的也没人读——
+            # 客户端下次启动会按自己的规则初始化，反而可能覆盖我们的。
+            return False, ('WorkBuddy 还没初始化过：先打开一次客户端，让它把配置目录建出来，再按 [W]')
+        items = []
+        box = items                      # 客户端还没建过自定义模型，我们建一个
     except Exception as e:
-        return False, '写入失败：%s' % e
-    return True, 'WorkBuddy 里已换成令牌，原文件备份在 %s。重启 WorkBuddy 生效' % os.path.basename(bak)
+        return False, '读不了模型清单：%s' % e
+
+    existing = next((it for it in items
+                     if isinstance(it, dict) and is_our_url(it.get('url'), cfg)), None)
+    sample = next((it for it in items
+                   if isinstance(it, dict) and str(it.get('id')) == base), None)
+
+    foreign = {str(it.get('id') or '') for it in items
+               if isinstance(it, dict) and not is_our_url(it.get('url'), cfg)}
+    cur = str((existing or {}).get('id') or '').strip()
+    if cur and cur not in foreign:
+        chosen = cur                     # 沿用现有 id，别让用户的选择失效
+    else:
+        chosen = choose_model_id(base, items, cfg)
+
+    # 能力字段（是否支持工具/图片/思考、思考档位）照抄同一个模型那条，
+    # 不靠猜。已有条目优先，这样以后客户端多出字段也不会被我们抹掉。
+    seed = existing or sample or {}
+    # 显示名从哪来：现成的优先。但它若已被客户端冲成 id（名字和 id 一个样），
+    # 就不能拿它当种子——否则会修成「OC · deepseek-v4.1-flash-oc」这种废话。
+    # 这时退回同一个模型那条真名的显示名。
+    # 全新机器上一条参照都没有：不加前缀，直接用 id 本身，别造出
+    # 「OC · deepseek-v4.1-flash」这种既长又没信息量的名字。
+    name_seed = str(seed.get('name') or '').strip()
+    ref = str((sample or {}).get('name') or '').strip()
+    if name_seed and name_seed not in (base, chosen, str(seed.get('id') or '')):
+        name = display_name(name_seed)
+    elif ref:
+        name = display_name(ref)
+    else:
+        name = chosen
+    ent = {'id': chosen,
+           'name': name,
+           'vendor': str(seed.get('vendor') or 'Custom')}
+    for k, v in seed.items():
+        if k not in ('id', 'name', 'vendor', 'url', 'apiKey'):
+            ent[k] = v
+    ent['url'] = ours_url
+    # 密钥栏：本机一律不碰。
+    #   原本有值（用户填的 opencode 真钥匙）→ 原样保留，一个字都不改；
+    #   原本空着 → 留空，等用户自己填。
+    # 本项目不生成令牌、不写密钥，config.json 里也没有任何密钥。
+    old_key = str((existing or {}).get('apiKey') or '').strip()
+    ent['apiKey'] = old_key
+
+    body_changed = existing is None or existing != ent
+
+    al = dict(cfg.get('model_aliases') or {})
+    al = {k: v for k, v in al.items() if not (v == base and k != chosen)}
+    if chosen != base:
+        al[chosen] = base
+    alias_changed = al != (cfg.get('model_aliases') or {})
+
+    if not body_changed and not alias_changed:
+        return False, 'WorkBuddy 里那条已经是对的，没动文件'
+
+    bak = None
+    if body_changed:
+        if existing is not None:
+            items[items.index(existing)] = ent
+        else:
+            items.append(ent)
+        try:
+            bak = _write_models(box)
+        except Exception as e:
+            return False, '写不进模型清单：%s' % e
+        try:                             # 回读：能解析、条目在、密钥与地址对得上
+            back, _ = _read_models()
+            got = next((it for it in back if str(it.get('id')) == chosen), None)
+            if not got:
+                raise ValueError('回读找不到 %s' % chosen)
+            if str(got.get('apiKey')) != ent['apiKey']:
+                raise ValueError('回读密钥不一致')
+            if str(got.get('url')) != ours_url:
+                raise ValueError('回读地址不一致')
+        except Exception as e:
+            if bak:
+                shutil.copy2(bak, MODELS_JSON)
+            return False, '写完回读对不上，已还原（%s）' % e
+
+    if alias_changed:
+        cfg['model_aliases'] = al
+        save(cfg)
+
+    msg = '已写入 WorkBuddy：%s，名字「%s」' % (chosen, ent['name'])
+    if chosen != base:
+        msg += '，发上游前自动改回 %s' % base
+    msg += ('。钥匙那栏保留你填的' if old_key
+            else '。钥匙那栏空着，请填 opencode 里那把真钥匙')
+    if bak:
+        msg += '；原文件备份 %s' % os.path.basename(bak)
+    return True, msg + '。重启 WorkBuddy 生效'
+
+
+def check_workbuddy_entry(cfg=None):
+    """看 WorkBuddy 里那条现在什么状态，给界面做提示。
+
+    返回 (状态, 一句话)。状态：ok / missing / drift / conflict / nofile / unreadable
+    """
+    cfg = cfg or load()
+    base = str(cfg.get('model') or '').strip() or 'deepseek-v4.1-flash'
+    try:
+        items, _ = _read_models()
+    except FileNotFoundError:
+        return 'nofile', 'WorkBuddy 还没建过模型清单'
+    except Exception:
+        return 'unreadable', '模型清单读不了，先按 [W] 重写一次'
+
+    ent = next((it for it in items
+                if isinstance(it, dict) and is_our_url(it.get('url'), cfg)), None)
+    if not ent:
+        return 'missing', 'WorkBuddy 里还没有本机这条，按 [W] 写入'
+
+    got_id = str(ent.get('id') or '')
+    got_name = str(ent.get('name') or '')
+    want = display_name(got_name or base)
+    if got_name != want:                 # 客户端保存时用 id 覆盖了名字
+        return 'drift', '显示名被客户端冲成了 %s，按 [W] 修回' % got_name
+    if got_id != base and (cfg.get('model_aliases') or {}).get(got_id) != base:
+        return 'conflict', '%s 没进别名表，上游会说模型不可用，按 [W] 修' % got_id
+    k = str(ent.get('apiKey') or '').strip()
+    if not k:
+        return 'nokey', '条目在，密钥那栏空着 —— 请转到 WorkBuddy 上填写对应的 opencode 套餐密钥'
+    if is_local_token(k):                # 旧版本遗留的令牌，本项目已不再签发
+        return 'nokey', '那栏是旧版本的令牌，本项目已不签发 —— 改填 opencode 的真钥匙'
+    return 'ok', '已配好（%s，钥匙在 WorkBuddy）' % got_name
 
 
 # ---------------------------------------------------------------- 剪贴板
@@ -466,12 +632,11 @@ def proxy_env(cfg=None):
     env['TUI'] = '0'                       # 后台实例没有控制台，别跑按键界面
     env['PORT'] = str(cfg.get('port') or PORT)
     env['UPSTREAM_BASE'] = cfg.get('upstream') or DEFAULT_UPSTREAM
-    env['PROXY_TOKEN'] = cfg.get('local_key') or ''
-    key = get_key(cfg)
-    if key:
-        env['OPENCODE_API_KEY'] = key
-    else:
-        env.pop('OPENCODE_API_KEY', None)
+    # 明确清掉这两项：本项目不保存、也不注入任何密钥。
+    # 不清理的话，环境里若恰好有残留（旧版本、别的工具设过），
+    # 代理会悄悄用上，出问题时谁都说不清钥匙从哪来的。
+    env.pop('OPENCODE_API_KEY', None)
+    env.pop('PROXY_TOKEN', None)
     return env
 
 
@@ -539,15 +704,35 @@ def restart(log=print):
     return start(log)
 
 
+def wb_model_id(cfg=None):
+    """WorkBuddy 里该填哪个 id：已经写过就用那条的，没写过就按避让规则算。
+
+    手抄路径和自动写入必须给同一个答案，否则用户按抄的去填，又和自动写的
+    那条撞上。
+    """
+    cfg = cfg or load()
+    base = str(cfg.get('model') or '').strip() or 'deepseek-v4.1-flash'
+    try:
+        items, _ = _read_models()
+    except Exception:
+        return base
+    ent = next((it for it in items
+                if isinstance(it, dict) and is_our_url(it.get('url'), cfg)), None)
+    if ent and str(ent.get('id') or '').strip():
+        return str(ent['id']).strip()
+    return choose_model_id(base, items, cfg)
+
+
 def access_block(cfg=None):
-    """复制给 WorkBuddy 用的那段文本 —— 这是软件"吐"出来的东西，不是用户填的。"""
+    """手填时要用的那几项。密钥不在里面——本项目不碰钥匙。"""
     cfg = cfg or load()
     lines = ['OpenCode Go · 填进 WorkBuddy 的自定义模型',
              '接口地址  http://127.0.0.1:%d/v1/chat/completions'
-             % int(cfg.get('port') or PORT),
-             '接口密钥  %s' % (cfg.get('local_key') or '')]
-    if cfg.get('model'):
-        lines.append('模型名称  %s' % cfg['model'])
+             % int(cfg.get('port') or PORT)]
+    want = wb_model_id(cfg)
+    if want:
+        lines.append('模型名称  %s' % want)
+    lines.append('接口密钥  请转到 WorkBuddy 上填写对应的 opencode 套餐密钥')
     return '\n'.join(lines)
 
 

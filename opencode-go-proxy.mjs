@@ -165,9 +165,10 @@ const CFG = (() => {
   } catch { return {}; }
 })();
 const UPSTREAM = (process.env.UPSTREAM_BASE || CFG.upstream || 'https://opencode.ai/inference/go').replace(/\/+$/, '');
+// 本项目不保存任何密钥：这两个变量只为兼容旧部署留着。
+// 正常情况它们都是空的——钥匙由客户端每次请求带来，这里原样转发。
 const ENV_KEY = process.env.OPENCODE_API_KEY || '';
-// 客户端填的"本地令牌"：代理收到它就换成真钥匙，真钥匙因此不必写进客户端配置。
-const LOCAL_TOKEN = (process.env.PROXY_TOKEN || CFG.local_key || '').trim();
+const LOCAL_TOKEN = (process.env.PROXY_TOKEN || '').trim();
 const RETRIES = Number(process.env.PROXY_RETRIES ?? 3);
 const CONNECT_TIMEOUT = Number(process.env.CONNECT_TIMEOUT_MS || 30000);
 const IDLE_TIMEOUT = Number(process.env.IDLE_TIMEOUT_MS || 0);
@@ -329,7 +330,7 @@ function buildHeaders(incoming) {
   }
   if (incoming.__gzip) out['content-encoding'] = 'gzip';
   out['x-opencode-session'] = sessionFor(incoming);
-  out['user-agent'] = 'workbuddy-opencode-go-proxy/4.9';
+  out['user-agent'] = 'workbuddy-opencode-go-proxy/' + VERSION;
   out['accept-encoding'] = 'identity';
   delete out['x-wb-session'];
   return out;
@@ -608,7 +609,13 @@ function onceAttempt(req, res, body, attempt, state) {
       });
       tap.on('end', () => {
         try { harvest(bufs, status); } catch { /* 收集失败不影响转发 */ }
-        if (status === 400) dumpFail(state.rawBody || body, bufs);
+        if (status === 400) {
+          dumpFail(state.rawBody || body, bufs);
+          try {
+            const asked = JSON.parse((state.rawBody || body).toString('utf8')).model;
+            aliasHint(String(asked || ''), Buffer.concat(bufs).toString('utf8'));
+          } catch { /* 请求体不是 JSON 就不用提示 */ }
+        }
       });
       upstreamRes.pipe(tap).pipe(res);
     });
@@ -684,7 +691,8 @@ const sessionLabels = new Map();   // 会话身份 -> 人看得懂的标签
 // 控制台日志是一直流下去的，人眼很难判断"现在到底有没有在跑"。这里留一份最近状态，
 // 浏览器打开 http://127.0.0.1:8787/ 就能一眼看完。
 const STARTED_AT = Date.now();
-const VERSION = '4.9';
+// 版本号三段式（主.次.修）：加功能升次版本，只改错升修订，破坏性改动升主版本。
+const VERSION = '5.0.0';
 const RECENT_MAX = 200;
 const recent = [];
 const stat = { total: 0, ok: 0, fail: 0, repaired: 0, filled: 0 };
@@ -885,6 +893,46 @@ function startTui() {
   drawTui();
 }
 
+// 模型别名表：客户端填给代理的 id → 上游真 id。
+// 为什么需要：WorkBuddy 的模型选择器按 id 去重，OpenDesign 与本机代理两条都填真实 ID
+// 时界面只显示一条、选不到另一条。给本机这条单独一个后缀别名，发上游前改回真实 ID。
+// 表放在 config.json 的 model_aliases 里，升级覆盖代码也不会丢；不配就和以前完全一样。
+const MODEL_ALIASES = (() => {
+  const raw = CFG.model_aliases;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  const out = {};
+  for (const [alias, real] of Object.entries(raw)) {
+    if (typeof alias === 'string' && typeof real === 'string' && alias && real) out[alias] = real;
+  }
+  return out;
+})();
+const HAS_ALIASES = Object.keys(MODEL_ALIASES).length > 0;
+
+// 客户端填了别名表里没有的 id、上游又回 400 时，八成就是别名没配。
+// 这里把话说透，省得半年后再回来问"模型不可用是怎么回事"。
+function aliasHint(modelId, resText) {
+  if (!/model/i.test(resText) || !/unavailab|not found|invalid/i.test(resText)) return false;
+  if (MODEL_ALIASES[modelId]) return false;
+  const list = HAS_ALIASES
+    ? Object.entries(MODEL_ALIASES).map(([a, r]) => `${a} → ${r}`).join('、')
+    : '（还没配任何别名）';
+  console.log(`[model] 上游不认识 "${modelId}"。若这是你想用的别名，请在 config.json 的 model_aliases 里加一行。当前别名：${list}`);
+  return true;
+}
+
+function rewriteModelAlias(buf) {
+  if (!buf || !buf.length) return buf;
+  if (!HAS_ALIASES) return buf;          // 表空就一个字都不用解析，零开销
+  let j;
+  try { j = JSON.parse(buf.toString('utf8')); } catch { return buf; }
+  if (!j || typeof j.model !== 'string') return buf;
+  const real = MODEL_ALIASES[j.model];
+  if (!real) return buf;
+  console.log(`[model] 别名 ${j.model} → ${real}`);
+  j.model = real;
+  try { return Buffer.from(JSON.stringify(j), 'utf8'); } catch { return buf; }
+}
+
 // 诊断：客户端到底有没有把"这是哪个会话"传过来。
 // 前三次请求把请求头键名和疑似会话标识打印出来，看一眼就知道能不能直接查标题。
 let headerProbe = 0;
@@ -902,7 +950,7 @@ async function relay(req, res, body) {
   }
   // 先把缺的 reasoning_content 补上，再算身份、再发上游
   const repaired = injectReasoning(body);
-  body = repaired.buf;
+  body = rewriteModelAlias(repaired.buf);
   const info = deriveSessionInfo(body);
   const convId = String(req.headers['x-conversation-id'] || '');
   const convTitle = titleFor(convId);
@@ -1046,8 +1094,10 @@ server.timeout = 0;
     console.log(`outbound ${OUTBOUND_DIRECT ? 'DIRECT (no proxy)' : `via proxy ${PROXY.host}:${PROXY.port}`}`);
     console.log(`session  ${DEFAULT_SESSION}`);
     console.log(`retries ${RETRIES} | gzip ${GZIP ? 'ON' : 'off'} | connectTimeout ${CONNECT_TIMEOUT}ms | tlsBudget ${TLS_BUDGETS.join('/')}ms | idleTimeout ${IDLE_TIMEOUT || 'unlimited'} | keepAliveTimeout ${KEEPALIVE_TIMEOUT || 'unlimited'}`);
-    if (!ENV_KEY) console.log('提示：没读到上游密钥。打开控制台按 [C] 填进去，保存后会自动重启。');
-    if (LOCAL_TOKEN) console.log('本地令牌已启用：客户端填本地令牌即可，真钥匙不会落到客户端。');
+    // 本项目不读、不存密钥：钥匙由客户端每次请求带来。
+    // 这两条只在有人手工塞了环境变量时才打印，正常部署一个字都不会出现。
+    if (ENV_KEY) console.log('注意：检测到环境变量里的上游密钥，将优先使用它（正常部署不该有）。');
+    if (LOCAL_TOKEN) console.log('注意：检测到旧的本地令牌，仅作兼容保留（本项目已不签发）。');
     startTui();
   });
 })();

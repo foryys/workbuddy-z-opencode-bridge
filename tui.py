@@ -222,11 +222,11 @@ ST = {
     'busy': '',
     'at': 0.0,
     'wb': None, 'wb_at': 0.0,       # WorkBuddy 里那条模型配置的缓存
+    'wb_state': None,               # 那条配置的体检结果（ok/missing/drift/conflict…）
 }
 
 FIELDS = {
     'upstream': ('上游地址', 'https://opencode.ai/inference/go'),
-    'key': ('上游密钥', '按 Ctrl+V 粘贴（或右键粘贴），回车保存'),
     'model': ('默认模型', '填上游支持的模型 ID，或按 [M] 从列表挑'),
 }
 
@@ -247,38 +247,30 @@ def fetch():
         ST['d'] = d
         ST['off'] = False
         ST['err'] = ''
-    # WorkBuddy 那边用的是真钥匙还是本地令牌？决定主页该怎么说话。
+    # WorkBuddy 那条现在什么状态？决定主页该怎么说话。
     # 每秒读一次小 json 可以接受，但没必要：10 秒刷一次就够。
     if time.time() - ST.get('wb_at', 0) > 10:
         ST['wb'] = C.detect_proxy_entry()
+        ST['wb_state'] = C.check_workbuddy_entry(ST['cfg'])
         ST['wb_at'] = time.time()
     ST['at'] = time.time()
 
 
 def upstream_state():
-    """钥匙在谁手上 —— 按客户端那栏判，不按本机存没存判。
+    """钥匙在哪 —— 只看 WorkBuddy 那一栏，本机不存钥匙。
 
-    这个软件的设计是：上游密钥保存在 WorkBuddy 里，启动器只负责桥接。
-    所以客户端那栏填什么才是主线索；本机的密文只管三种情况：
-
-    wb      客户端直接带真钥匙来 → 代理原样转发（正常形态）
-    local   客户端带的是本地令牌 → 代理用本机密文换掉再发上游
-    broken  客户端带令牌，本机密文解不开（换过账号/机器）→ 必然 401
-    no-key  客户端带令牌，本机压根没存过密文 → 必然 401
-    empty   客户端没配这条，本机也没有
+    ok      客户端那栏有 opencode 真钥匙 → 代理原样转发（唯一正常形态）
+    nokey   条目在，但那栏还空着 → 填上就能用
+    legacy  那栏是旧版本的令牌 → 本项目已不签发，要改填真钥匙
+    empty   客户端里压根没有这条 → 按 [W] 写进去
     """
-    cfg = ST['cfg']
     wb = ST.get('wb') or {}
     wbkey = str(wb.get('apiKey') or '').strip()
-    if wbkey and not C.is_local_token(wbkey):
-        return 'wb'
-    if C.get_key(cfg):
-        return 'local'
-    if C.has_upstream(cfg):
-        return 'broken'          # 密文在，但解不开
-    if wbkey:
-        return 'no-key'          # 客户端拿令牌来，本机没钥匙可换
-    return 'empty'
+    if not wbkey:
+        return 'nokey' if wb else 'empty'
+    if C.is_local_token(wbkey):
+        return 'legacy'
+    return 'ok'
 
 
 def hms(ms):
@@ -316,26 +308,22 @@ def notice_text(page=None):
     page = page or ST['page']
     us = upstream_state()
     if page == 'config':
-        if us == 'wb':
+        if us == 'ok':
             return '钥匙在 WorkBuddy 里，代理只转发。换钥匙去客户端改，这里不用动。'
-        if us == 'local':
-            return '客户端持令牌，代理用本机密文换。要抄的是「第二步」那三项。'
-        if us == 'broken':
-            return '旧密文解不开（换了账号或机器）。按 [1] 重新填一把。'
-        if us == 'no-key':
-            return '客户端持令牌，本机没钥匙可换。按 [1] 填一把，或 [I] 取。'
-        return '按 [1] 填上游密钥，或 [I] 从 WorkBuddy 取（那边配过就不用手打）。'
+        if us == 'legacy':
+            return '那栏是旧版本的令牌，本项目已不签发 —— 改成 opencode 的真钥匙。'
+        if us == 'nokey':
+            return '请转到 WorkBuddy 上填写对应的 opencode 套餐密钥。'
+        return '按 [W] 写进 WorkBuddy，再把 opencode 的真钥匙填到那一栏就行。'
     if page == 'models':
         return '↑↓ 挑一个，回车设为默认模型；Esc 返回上一层。'
-    if us == 'wb':
+    if us == 'ok':
         return '正常：钥匙在 WorkBuddy，代理原样转发。'
-    if us == 'local':
-        return '正常：客户端只持令牌，真钥匙在代理的密文里。'
-    if us == 'broken':
-        return '密文解不开了（换过账号或机器）—— 按 [C] 进配置，按 1 重新填一把。'
-    if us == 'no-key':
-        return '客户端持令牌，本机没钥匙可换 —— 按 [C] 进配置按 1 填一把。'
-    return '还差一步：按 [C] 填密钥，或按 [I] 从 WorkBuddy 取。'
+    if us == 'legacy':
+        return '那栏是旧版本令牌，本项目已不签发 —— 改成 opencode 真钥匙。'
+    if us == 'nokey':
+        return '还差一步：请转到 WorkBuddy 上填写对应的 opencode 套餐密钥。'
+    return '还没配：按 [W] 写进 WorkBuddy，再把 opencode 的真钥匙填到那一栏。'
 
 
 # ------------------------------------------------------------------ 主页
@@ -364,29 +352,23 @@ def draw_main(W, H):
                 l.add(' ' * room).add(tail, tcol or DIM)
         out.append(row(W, l))
 
-    # 上半：客户端要填的两项 + 上游密钥在谁手上（都是"能不能用"的关键）
+    # 上半：客户端要填的两项 + 密钥在 WorkBuddy 那边的情况
     us = upstream_state()
     wb = ST.get('wb') or {}
     kv('接口地址', 'http://127.0.0.1:%d/v1/chat/completions'
        % int(cfg.get('port') or PORT), WHITE)
-    kv('接口密钥', C.mask(cfg.get('local_key')), CYAN, '复制 [Y]')
-    if us == 'wb':
-        # 主形态：钥匙在 WorkBuddy，代理只转发。这把钥匙一律不露片段。
-        kv('上游密钥', '已在 WorkBuddy 中填写', GREEN, '代理只转发', DIM)
-    elif us == 'local':
-        live = (not off) and bool(d.get('hasKey'))
-        kv('上游密钥', '已在本机加密保存', GREEN if live else YELLOW,
-           '客户端持令牌' if live else '代理没加载',
-           GREEN if live else YELLOW)
-    elif us == 'broken':
-        # 密文在，解不开。换 Windows 账号、换机器、重装系统都会这样。
-        # 这时说「还没填」是误导——他填过，是旧密文作废了，得重填一把。
-        kv('上游密钥', '(旧密文解不开)', RED,
-           '换过账号或机器 → 按 [C] 重新填', RED)
-    elif us == 'no-key':
-        kv('上游密钥', '(缺)', RED, '客户端拿令牌来，本机没钥匙 → 会 401', RED)
+    kv('接口密钥', '在 WorkBuddy 里填', WHITE, '本项目不存', DIM)
+    if us == 'ok':
+        # 唯一正常形态：钥匙在 WorkBuddy，代理只转发。这把钥匙一律不露片段。
+        kv('上游密钥', '在 WorkBuddy 里', GREEN, '代理只转发', DIM)
+    elif us == 'legacy':
+        kv('上游密钥', '旧版本令牌（要换掉）', YELLOW,
+           '本项目已不签发 → 改填真钥匙', YELLOW)
+    elif us == 'nokey':
+        kv('上游密钥', '(WorkBuddy 那栏空着)', YELLOW,
+           '请转到 WorkBuddy 填写', YELLOW)
     else:
-        kv('上游密钥', '(还没填)', YELLOW, '按 [C] 进配置，再按 1 粘贴', YELLOW)
+        kv('上游密钥', '(还没配)', YELLOW, '按 [W] 写进去，密钥你在客户端填', YELLOW)
 
     # 下半：代理自身的状态
     if off:
@@ -480,6 +462,7 @@ def draw_main(W, H):
     out.append(bar(W))
     l = L().add(' ')
     l.add('[C]', CYAN).add(' 配置  ', GREY)
+    l.add('[W]', CYAN).add(' 写入WorkBuddy  ', GREY)
     l.add('[Y]', CYAN).add(' 复制配置  ', GREY)
     l.add('[A]', CYAN).add(' 自启:', GREY)
     l.add('开  ' if ST['autostart'] else '关  ',
@@ -496,12 +479,10 @@ def draw_main(W, H):
 
 # ------------------------------------------------------------------ 配置页
 def draw_config(W, H):
-    """两段式：上半是你填的，下半是软件给你的。
+    """两段式：上半是密钥在哪，下半是软件替你写什么。
 
-    上一版把两把钥匙都叫「接口密钥」，用户不知道哪把是自己填、哪把是拿去贴的。
-    现在区块标题直接写明「你填进去 / 抄进 WorkBuddy」，名字也分开：
-      上游密钥 —— 从 opencode 拿的真钥匙，只有代理用
-      接口密钥 —— 软件发的本地令牌，填进 WorkBuddy 的
+    本项目不保存密钥，所以这一页不再有「填密钥」的输入框。
+    密钥只有一处：WorkBuddy 那条模型的密钥栏，由用户自己填。
     """
     out = []
     cfg = ST['cfg']
@@ -524,75 +505,92 @@ def draw_config(W, H):
     out.append(bar(W, '第一步 · 上游钥匙', 'WorkBuddy 里那把', CYAN))
     us = upstream_state()
     wb = ST.get('wb') or {}
-    if us == 'wb':
-        line('上游密钥', '已在 WorkBuddy 中填写', GREEN, '', '',
-             '代理转发时直接用', DIM)
-    elif us == 'local':
-        line('上游密钥', '已在本机加密保存', GREEN, '1', '更换',
-             '客户端持令牌', DIM)
-    elif us == 'broken':
-        line('上游密钥', '(旧密文解不开)', RED, '1', '重新填', '换了账号或机器', RED)
+    if us == 'ok':
+        line('上游密钥', '在 WorkBuddy 里（本项目不存）', GREEN, '', '',
+             '代理只转发', DIM)
+    elif us == 'legacy':
+        line('上游密钥', '旧版本的令牌（要换成真钥匙）', YELLOW, '', '',
+             '去客户端改', DIM)
         out.append(row(W, L().add('   ').add(
-            '密文绑本机账号，换机器或重装就解不开，只能重填一把。',
+            '本项目已不再签发令牌。把 WorkBuddy 那栏改成 opencode 的真钥匙。',
             YELLOW)))
-    elif us == 'no-key':
-        line('上游密钥', '(缺)', RED, '1', '填一把', '本机没钥匙，换不了令牌', RED)
+    elif us == 'nokey':
+        line('上游密钥', '(WorkBuddy 那栏还空着)', YELLOW, '', '',
+             '请转到 WorkBuddy', DIM)
+        out.append(row(W, L().add('   ').add(
+            '请转到 WorkBuddy 上填写对应的 opencode 套餐密钥，填完就通了。',
+            FAINT)))
     else:
-        line('上游密钥', '(还没填)', YELLOW, '1', '填写', '必需', YELLOW)
+        line('上游密钥', '(还没配)', DIM, '', '', '按 [W] 开始', DIM)
+        out.append(row(W, L().add('   ').add(
+            '按 [W] 写进 WorkBuddy，密钥由你自己在客户端填；本项目不保存。',
+            FAINT)))
     line('上游地址', cut(cfg.get('upstream', ''), max(10, W - 26)), WHITE, '2', '修改')
     line('默认模型', cfg.get('model') or '(未设置)',
          WHITE if cfg.get('model') else DIM, '3', '修改')
     line('开机自启', '已开启' if ST['autostart'] else '已关闭',
          GREEN if ST['autostart'] else DIM, '4', '切换')
 
-    # ---- 第二步：软件给你
-    out.append(bar(W, '第二步 · 抄进 WorkBuddy',
-                   '软件生成的，不用手打', CYAN))
+    # ---- 第二步：写进 WorkBuddy
+    out.append(bar(W, '第二步 · 写进 WorkBuddy',
+                   '按 [W] 自动填，密钥你手填', CYAN))
     port = int(cfg.get('port') or PORT)
     line('接口地址', 'http://127.0.0.1:%d/v1/chat/completions' % port, WHITE)
-    line('接口密钥', C.mask(cfg.get('local_key')), CYAN, '5', '换一把')
-    line('模型名称', cfg.get('model') or '(未设置)', WHITE)
-    if us == 'wb':
+    line('模型名称', C.wb_model_id(cfg) or '(未设置)', WHITE)
+    line('接口密钥', '到 WorkBuddy 里填套餐密钥', WHITE)
+    if us == 'ok':
         out.append(row(W, L().add('   ').add(
-            '接口密钥填真钥匙就行；想让客户端不存明文，才填下面那把令牌。',
+            '已经填好了，不用动。换钥匙去 WorkBuddy 那条模型的设置里改。',
+            DIM)))
+    elif us == 'legacy':
+        out.append(row(W, L().add('   ').add(
+            '[!] 那栏是旧版本令牌，本项目已不签发，请求会 401。改成真钥匙。',
+            YELLOW)))
+    elif us == 'nokey':
+        out.append(row(W, L().add('   ').add(
+            '条目已就位，请转到 WorkBuddy 上填写对应的 opencode 套餐密钥。',
             FAINT)))
-    elif us == 'local':
-        out.append(row(W, L().add('   ').add(
-            '客户端只持令牌：接口密钥填 sk-ocg- 那把。', FAINT)))
-    elif us == 'broken':
-        out.append(row(W, L().add('   ').add(
-            '[!] 旧密文解不开，抄过去一定 401。先按 [1] 重填。', YELLOW)))
-    elif us in ('no-key', 'empty'):
-        out.append(row(W, L().add('   ').add(
-            '[!] 本机没有可用钥匙，填令牌会 401。先按 [1] 填一把。', YELLOW)))
     elif ST['off']:
         out.append(row(W, L().add('   ').add(
-            '[!] 代理没在跑，抄过去也连不上。双击桌面图标拉起。', YELLOW)))
+            '[!] 代理没在跑，配好了也连不上。双击桌面图标拉起。', YELLOW)))
     else:
         out.append(row(W, L().add('   ').add(
-            '按 [Y] 把上面三项一次复制走（不含表头，方便分段粘）', FAINT)))
+            '按 [W] 一步写进去；想手抄就按 [Y] 把上面两项复制走', FAINT)))
+
+    # WorkBuddy 里那条现在什么状态 —— 缺了、名字被冲掉了、别名没配，都在这说
+    st, why = ST.get('wb_state') or (None, '')
+    if st == 'ok':
+        out.append(row(W, L().add('   ').add('WorkBuddy 那条：' + why, DIM)))
+    elif st == 'nokey':
+        out.append(row(W, L().add('   ').add('WorkBuddy 那条：' + why, CYAN)))
+    elif st == 'nofile':
+        out.append(row(W, L().add('   ').add(
+            'WorkBuddy 那条：还没建过，按 [W] 会替你写一条', FAINT)))
+    elif st:
+        out.append(row(W, L().add('   ').add('[!] ' + why, YELLOW)))
 
     # ---- 怎么填
     room = H - len(out) - 4
-    if room >= 7:
+    if room >= 9:
         out.append(bar(W, '在 WorkBuddy 里怎么填'))
         steps = [
-            '1  模型设置里新增一个「自定义 / OpenAI 兼容」模型',
-            '2  接口地址整串照抄（含 /v1/chat/completions）',
-            '3  密钥填「接口密钥」那把（本地令牌，不是上游真钥匙）',
-            '4  模型名称填上面对应的那个；拿不准按 [M] 从上游列表挑',
-            '5  保存后发一句话，回主页看「最近请求」是不是 200',
+            '1  按 [W] 直接写进去（推荐）：id、名字、地址一次填好，不用手打',
+            '2  想手填也行：模型设置里新增一个「自定义 / OpenAI 兼容」模型',
+            '3  接口地址整串照抄（含 /v1/chat/completions）',
+            '4  密钥请转到 WorkBuddy 上填写对应的 opencode 套餐密钥',
+            '5  模型名称填上面对应的那个；拿不准按 [M] 从上游列表挑',
+            '6  保存后发一句话，回主页看「最近请求」是不是 200',
         ]
         for t in steps:
             out.append(row(W, L().add('   ').add(t, GREY)))
         room = H - len(out) - 4
 
-    # ---- 密钥怎么存的（用户最关心这条，顺便把版面填实）
+    # ---- 密钥在哪（这条最该说清：本项目手里没有钥匙）
     if room >= 5:
-        out.append(bar(W, '密钥怎么存的'))
-        for t in ('两把钥匙都只存密文：Windows DPAPI 加密，绑当前账号 + 这台机器',
-                  'config.json 里没有明文；文件拷到别的电脑或别的账号也解不开',
-                  '上游真钥匙只经环境变量传给代理进程，不写进任何文件'):
+        out.append(bar(W, '密钥在哪'))
+        for t in ('密钥只存在 WorkBuddy 里，本项目不保存、不复制、不写进任何文件',
+                  '代理只是中转：客户端每次请求带着凭据过来，它原样转发',
+                  '所以本项目手里没有可泄露的东西；泄不泄露不归本项目管'):
             out.append(row(W, L().add('   ').add(t, DIM)))
         room = H - len(out) - 4
     for _ in range(max(0, room)):
@@ -600,11 +598,9 @@ def draw_config(W, H):
 
     out.append(bar(W))
     l = L().add(' ')
-    l.add('[1][2][3]', CYAN).add(' 编辑  ', GREY)
+    l.add('[2][3]', CYAN).add(' 编辑  ', GREY)
     l.add('[4]', CYAN).add(' 自启  ', GREY)
-    l.add('[5]', CYAN).add(' 换令牌  ', GREY)
-    l.add('[I]', GREEN).add(' 导入  ', GREY)
-    l.add('[T]', GREEN).add(' 清明文  ', GREY)
+    l.add('[W]', CYAN).add(' 写入  ', GREY)
     l.add('[M]', CYAN).add(' 拉模型  ', GREY)
     l.add('[Y]', GREEN).add(' 复制  ', GREY)
     l.add('[Esc]', CYAN).add(' 返回', GREY)
@@ -656,16 +652,7 @@ def draw_edit(W, H):
     label = FIELDS.get(field, (field, ''))[0]
     hint = FIELDS.get(field, ('', ''))[1]
     l = L().add(' ').add(label + ' > ', CYAN)
-    if field == 'key':
-        # 密钥不上屏。但得让人看得见"到底粘进来没有"，
-        # 所以用圆点数表示长度 —— 看得见长度，看不见内容。
-        if ST['buf']:
-            l.add('*' * min(len(ST['buf']), 48), WHITE)
-            l.add('█', CYAN)
-            l.add('   已输入 %d 个字符' % len(ST['buf']), GREEN)
-        else:
-            l.add('█', CYAN).add('  ' + hint, FAINT)
-    else:
+    if True:
         l.add(ST['buf'], WHITE).add('█', CYAN)
         if not ST['buf']:
             l.add('  ' + hint, FAINT)
@@ -709,24 +696,20 @@ def render():
 
 # ------------------------------------------------------------------ 动作
 def copy_access():
-    """按顺序来：没填上游密钥就不发"看起来能用"的配置。
-
-    上一版是先复制再提醒，用户粘进 WorkBuddy 发现 401，回来问"是不是坏了"。
-    现在直接把光标带到填密钥那一栏——差的就是这一步。
-    """
+    """复制手填要用的那两项（地址、模型名）。密钥不在里面——本项目不碰钥匙。"""
     cfg = ST['cfg']
-    if not C.has_upstream(cfg):
-        flash('先填上游密钥：粘贴后回车。填完我再把配置给你', 12.0)
-        ST['page'] = 'config'               # 不然输入行会画在主页上，看不出在填什么
-        start_edit('key')
-        return
+    st = upstream_state()
     ok = C.copy_text(C.access_block(cfg))
-    if not ok:
+    if st == 'legacy':
+        flash('复制了。但那栏是旧版本令牌、本项目已不签发 —— 改成 opencode 真钥匙', 12.0)
+    elif st == 'nokey':
+        flash('复制了，但 WorkBuddy 那栏还空着 —— 填上 opencode 的真钥匙才能用', 12.0)
+    elif not ok:
         flash('复制失败：剪贴板被别的程序占着，再按一次 [Y]')
     elif ST['off']:
         flash('已复制。但代理没在跑，粘过去也连不上 —— 先双击桌面图标', 9.0)
     else:
-        flash('已复制：接口地址 + 接口密钥 + 模型，直接粘进 WorkBuddy')
+        flash('已复制：接口地址 + 模型名（密钥自己填，本项目不存）')
 
 
 def toggle_autostart():
@@ -758,49 +741,39 @@ def do_save(need_restart=True):
     return True
 
 
-def do_import():
-    """把 WorkBuddy 里那把上游钥匙收进本机加密配置。
+def wb_key(cfg=None):
+    """读 WorkBuddy 那栏的钥匙 — 只在内存里用一下，绝不落盘。
 
-    这不是「替你输入」的偷懒做法，而是应对一种真实处境：
-    opencode 后台只显示一次，之后列表里看不到，用户手头就没钥匙了。
-    但机器上还留着一份在 WorkBuddy 的 models.json 里——就地搬过来。
+    为什么需要：拉模型列表这个动作用得上它。读一次、发一个请求、
+    用完就丢；本项目不保存、不复制、不写进任何文件。
+    """
+    it = C.detect_proxy_entry() or {}
+    return str(it.get('apiKey') or '').strip()
+
+
+def do_write_workbuddy():
+    """把本机这条直接写进 WorkBuddy，省掉手工抄四步。
+
+    干三件事：写条目（id 撞了自动加后缀避让）、把「这个 id → 上游真名」
+    的映射同步给代理、写完回读校验。别人那几条一字不动。
+    可以反复按，已经对了就说「没动文件」。
     """
     cfg = ST['cfg']
-    ok, msg = C.import_from_workbuddy(cfg)
-    if not ok:
-        flash(msg, 10.0)
-        return
+    ok, msg = C.ensure_workbuddy_entry(cfg)
     ST['wb'] = C.detect_proxy_entry()
+    ST['wb_state'] = C.check_workbuddy_entry(ST['cfg'])
     ST['wb_at'] = time.time()
-    do_save()
-    flash(msg + '。现在按 [Y] 复制', 12.0)
-
-
-def do_strip_plaintext():
-    """把 WorkBuddy 里那栏真钥匙换成令牌，明文只留密文那一份。
-
-    前置条件必须检查：代理得先真的加载了钥匙。否则换完令牌，
-    代理手上没钥匙可换，请求立刻 401——用户会以为是我搞坏了。
-    """
-    cfg = ST['cfg']
-    if not C.has_upstream(cfg):
-        flash('本机还没有钥匙，换了就没人能换回来。先按 [I] 导入', 10.0)
-        return
-    if not ST['off'] and not (ST['d'] or {}).get('hasKey'):
-        flash('代理还没加载钥匙。先让它重启一次（按 [S]），再来清明文', 10.0)
-        return
-    ok, msg = C.swap_workbuddy_token(cfg)
-    if not ok:
-        flash(msg, 10.0)
-        return
-    ST['wb'] = C.detect_proxy_entry()
-    ST['wb_at'] = time.time()
+    if ok:
+        do_save(need_restart=True)      # 别名表变了，代理得重读
     flash(msg, 14.0)
 
 
 def fetch_models():
     cfg = ST['cfg']
-    tok = cfg.get('local_key') or ''
+    tok = wb_key(cfg)
+    if not tok:
+        flash('拉模型要用密钥：先去 WorkBuddy 那条模型里填上 sk-…', 10.0)
+        return
     ST['busy'] = '正在向上游要模型列表……'
     render()
     req = urllib.request.Request(
@@ -821,7 +794,7 @@ def fetch_models():
     except urllib.error.HTTPError as e:
         err = '上游回 %d' % e.code
         if e.code in (401, 403):
-            err += '：密钥没生效，先 [S] 保存并重启'
+            err += '：密钥不对，去 WorkBuddy 那条模型里改'
     except Exception as e:
         err = '拉了 25 秒没结果（%s）' % type(e).__name__
     ST['busy'] = ''
@@ -847,8 +820,6 @@ def start_edit(field):
     cfg = ST['cfg']
     if field == 'upstream':
         cur = cfg.get('upstream', '')
-    elif field == 'key':
-        cur = ''                            # 明文不上屏
     elif field == 'model':
         cur = cfg.get('model', '')
     else:
@@ -861,32 +832,13 @@ def commit_edit():
     field = ST['edit']
     val = ST['buf'].strip()
     cfg = ST['cfg']
-    was_key = field == 'key'
     if field == 'upstream':
         cfg['upstream'] = val or C.DEFAULT_UPSTREAM
-    elif field == 'key':
-        # 右键粘贴/终端自己粘贴时，内容是当字符流进来的，不经过
-        # paste_into_buf，所以提交这里还要再洗一遍（去引号、去 Bearer 前缀）
-        cleaned = C.clean_key(val)
-        if not cleaned:                     # 空着回车＝不改，别把已存的擦了
-            ST['edit'] = None
-            ST['buf'] = ''
-            flash('没输入，上游密钥保持不变')
-            return
-        val = cleaned
-        C.set_key(cfg, val)
     elif field == 'model':
         cfg['model'] = val
     ST['edit'] = None
     ST['buf'] = ''
-    ok = do_save(need_restart=(field != 'model'))
-    if was_key and ok:
-        # 填完密钥就停在这儿最容易迷路，直接告诉他下一步。
-        # 只在真的存上时才说这句话：上一版无条件覆盖提示，
-        # 保存失败也照样显示「已加密存好」，用户以为填了其实没填。
-        flash('上游密钥已加密存好（%s）。现在按 [Y] 把配置复制走' % C.mask(val), 12.0)
-    elif was_key and not ok:
-        flash('上游密钥没存上，按 [1] 重填一次（原因见上一行）', 12.0)
+    do_save(need_restart=(field != 'model'))
 
 
 def request_quit_all():
@@ -912,18 +864,11 @@ def paste_into_buf():
     if not raw:
         flash('剪贴板里没有文字。先复制密钥，再按 Ctrl+V，或者右键粘贴', 8.0)
         return
-    was = ST['edit']
-    val = raw
-    if was == 'key':
-        val = C.clean_key(raw)
-    else:
-        val = raw.strip().replace('\r', ' ').replace('\n', ' ')
+    val = raw.strip().replace('\r', ' ').replace('\n', ' ')
     if not val:
-        flash('剪贴板内容看着不像密钥，检查一下复制的是什么', 8.0)
+        flash('剪贴板里没有可用文字', 8.0)
         return
     ST['buf'] = val
-    if was == 'key':
-        flash('已粘贴 %d 个字符，回车保存' % len(val), 6.0)
     return
 
 
@@ -950,7 +895,7 @@ def on_config_key(k):
     if k in ('\x1b', 'q'):
         ST['page'] = 'main'
     elif k == '1':
-        start_edit('key')
+        flash('密钥不在这里填：请转到 WorkBuddy 上填写对应的 opencode 套餐密钥', 11.0)
     elif k == '2':
         start_edit('upstream')
     elif k == '3':
@@ -958,17 +903,17 @@ def on_config_key(k):
     elif k == '4':
         toggle_autostart()
     elif k == '5':
-        C.rekey(ST['cfg'])
-        do_save()
-        flash('已换一把新令牌。回 WorkBuddy 把「接口密钥」重新粘一次，老的立刻失效', 10.0)
+        flash('本项目不再签发令牌：接口密钥填你自己的 opencode 真钥匙', 10.0)
     elif k == 'i':
-        do_import()
+        flash('不再需要导入：密钥就留在 WorkBuddy 里，本项目不保存', 10.0)
     elif k == 't':
-        do_strip_plaintext()
+        flash('那栏已经不该放令牌了：改成 opencode 的真钥匙就行', 10.0)
     elif k == 's':
         do_save()
     elif k == 'y':
         copy_access()
+    elif k == 'w':
+        do_write_workbuddy()
     elif k == 'm':
         fetch_models()
     return True
@@ -1006,6 +951,8 @@ def on_main_key(k):
         ST['page'] = 'config'
     elif k == 'y':
         copy_access()
+    elif k == 'w':
+        do_write_workbuddy()
     elif k == 'a':
         toggle_autostart()
     elif k == 'r':
