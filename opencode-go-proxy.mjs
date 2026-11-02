@@ -171,7 +171,12 @@ const ENV_KEY = process.env.OPENCODE_API_KEY || '';
 const LOCAL_TOKEN = (process.env.PROXY_TOKEN || '').trim();
 const RETRIES = Number(process.env.PROXY_RETRIES ?? 3);
 const CONNECT_TIMEOUT = Number(process.env.CONNECT_TIMEOUT_MS || 30000);
-const IDLE_TIMEOUT = Number(process.env.IDLE_TIMEOUT_MS || 0);
+// 上游静默超时：响应头到了之后，多长时间**一个字节都没有**才算死了。
+// 原来是 0（不限制）—— 那意味着「头回来了、流吐两口就停住」的请求永远挂着。
+// 实测成功的长请求最长 252 秒，但那是总时长；连续 5 分钟不吐一个字节的流，
+// 只可能是连接已经死了。所以默认 300 秒，比任何可接受的长思考都宽。
+// 要改：IDLE_TIMEOUT_MS；填 0 恢复旧的「不限制」。
+const IDLE_TIMEOUT = Number(process.env.IDLE_TIMEOUT_MS ?? 300000);
 // 请求已发出、但上游一个字节都不回时的上限。跨境直连偶尔会被静默丢弃（TCP 还在、
 // 对端不说话），这种连接永远不会自己好，只能到点掐掉，让客户端看到失败后重发。
 // 实测成功的长请求最长 252 秒，所以留到 7 分钟。
@@ -179,7 +184,11 @@ const FIRST_BYTE_TIMEOUT = Number(process.env.FIRST_BYTE_TIMEOUT_MS || 420000);
 // 请求体大（历史厚的会话能到 2–3MB）时，跨境直连上传容易被丢在中途。
 // 开 GZIP=1 就把请求体压一下再发，通常能小到十分之一。上游不认会报 400，关掉即可。
 const GZIP = process.env.GZIP === '1';
-const KEEPALIVE_TIMEOUT = Number(process.env.KEEPALIVE_TIMEOUT_MS || 0);
+// 客户端空闲连接的回收时间。原来是 0（永不回收）—— 实测（本机 node 22，人为设 0）
+// 客户端断开后那条 socket 8 秒过去仍不被服务端关掉，只增不减。
+// 长任务不受影响：那是"活动"连接，不是空闲连接。65 秒给客户端留足复用余量，
+// 又保证关掉的会话最终会被收走。填 0 仍然恢复旧行为（不回收）。
+const KEEPALIVE_TIMEOUT = Number(process.env.KEEPALIVE_TIMEOUT_MS ?? 65000);
 
 const RAW_PROXY = (process.env.PROXY_URL || 'http://127.0.0.1:7890').trim();
 // 直连模式下，TLS 握手超过预算就当作"这条路抖了"，掐掉换一次。
@@ -445,9 +454,12 @@ for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
   process.on(sig, () => { flushCache(); process.exit(0); });
 }
 
-function remember(text, reasoning) {
-  if (!text || !reasoning) return;
-  const k = hashText(text);
+function remember(text, reasoning, toolCalls) {
+  if (!reasoning) return;
+  // 与回填用同一个指纹函数：只按正文算，工具调用那一轮永远存不进来。
+  const key = answerKey(text, toolCalls);
+  if (!key) return;
+  const k = hashText(key);
   if (reasoningByText.get(k) === reasoning) return;
   reasoningByText.delete(k);
   reasoningByText.set(k, reasoning);
@@ -456,6 +468,25 @@ function remember(text, reasoning) {
     reasoningByText.delete(oldest);
   }
   scheduleSave();
+}
+
+// 「这条回答长什么样」的归一化指纹。存档与回填必须用同一个函数算，否则永远对不上。
+// 为什么不能只用正文：工具调用那一轮的 assistant 正文是空的（content 为 ''），
+// 只按正文算 key 会得到一个空串 —— 既进不了存档，也查不到，于是必然落占位，
+// 而且每轮都重来一次（实测真值只命中 16.8%，剩下的全是这种结构性失效）。
+// 所以正文空的时候改用 tool_calls 的「名字＋参数」拼出指纹。
+// 工具名和参数比正文更稳：同一轮调用的参数不会变。
+function answerKey(content, toolCalls) {
+  const text = textOf(content);
+  if (text) return 't:' + text;
+  if (Array.isArray(toolCalls) && toolCalls.length) {
+    const sig = toolCalls.map((c) => {
+      const f = (c && c.function) || {};
+      return (f.name || '') + '(' + (f.arguments || '') + ')';
+    }).join('|');
+    if (sig) return 'c:' + sig;
+  }
+  return '';
 }
 
 // 从上游回包里捡 reasoning_content：SSE 流和普通 JSON 都认
@@ -467,6 +498,21 @@ function harvest(bufs, status) {
   const raw = Buffer.concat(bufs).toString('utf8');
   if (!raw) return;
   let content = '', reasoning = '';
+  // 工具调用是分片吐的：delta.tool_calls 每条只带 index 和一小段
+  // function.arguments（有的还只带 name）。必须按 index 拼起来，
+  // 否则拿到的是半截 JSON，算出来的指纹和下一轮回填时对不上。
+  const calls = [];
+  const addCall = (tc) => {
+    if (!tc) return;
+    const i = Number.isInteger(tc.index) ? tc.index : calls.length;
+    if (!calls[i]) calls[i] = { id: '', type: 'function', function: { name: '', arguments: '' } };
+    const slot = calls[i];
+    if (tc.id) slot.id = tc.id;
+    if (tc.type) slot.type = tc.type;
+    const f = tc.function || {};
+    if (f.name) slot.function.name += f.name;
+    if (f.arguments) slot.function.arguments += f.arguments;
+  };
   if (raw.trimStart().startsWith('data:')) {
     for (const line of raw.split('\n')) {
       const t = line.trim();
@@ -479,6 +525,7 @@ function harvest(bufs, status) {
         const d = (c0 && (c0.delta || c0.message)) || {};
         if (typeof d.reasoning_content === 'string') reasoning += d.reasoning_content;
         if (typeof d.content === 'string') content += d.content;
+        if (Array.isArray(d.tool_calls)) d.tool_calls.forEach(addCall);
       } catch { /* 半截 JSON，跳过 */ }
     }
   } else {
@@ -488,13 +535,16 @@ function harvest(bufs, status) {
       const m = (c0 && (c0.message || c0)) || {};
       content = textOf(m.content);
       if (typeof m.reasoning_content === 'string') reasoning = m.reasoning_content;
+      if (Array.isArray(m.tool_calls)) m.tool_calls.forEach(addCall);
     } catch { /* 不是 JSON，跳过 */ }
   }
-  if (content && !reasoning && harvestProbe < 3) {
+  const toolCalls = calls.filter(Boolean);
+  if ((content || toolCalls.length) && !reasoning && harvestProbe < 3) {
     harvestProbe++;
-    console.log(`[harvest] 有正文(${content.length}字)但没解析到思考，原文开头=${JSON.stringify(raw.slice(0, 300))}`);
+    const what = content ? `有正文(${content.length}字)` : `有工具调用(${toolCalls.length}个)`;
+    console.log(`[harvest] ${what}但没解析到思考，原文开头=${JSON.stringify(raw.slice(0, 300))}`);
   }
-  remember(content, reasoning);
+  remember(content, reasoning, toolCalls);
 }
 
 const REASONING_PLACEHOLDER = '(reasoning omitted by local bridge)';
@@ -525,8 +575,8 @@ function injectReasoning(buf) {
     // 占位是我自己塞的，客户端会把它存进历史再回传；不认出来的话，真值永远换不回去
     const cur = m.reasoning_content;
     if (typeof cur === 'string' && cur && cur !== REASONING_PLACEHOLDER) continue;
-    const text = textOf(m.content);
-    const hit = text ? reasoningByText.get(hashText(text)) : null;
+    const key = answerKey(m.content, m.tool_calls);
+    const hit = key ? reasoningByText.get(hashText(key)) : null;
     if (hit) { m.reasoning_content = hit; injected++; }
     else { m.reasoning_content = REASONING_PLACEHOLDER; filled++; }
   }
@@ -564,6 +614,7 @@ function onceAttempt(req, res, body, attempt, state) {
     const isTls = u.protocol === 'https:';
 
     let firstByteTimer = null;
+    let idleTimer = null;
     const upstreamReq = mod.request({
       protocol: u.protocol,
       hostname: u.hostname,
@@ -592,10 +643,40 @@ function onceAttempt(req, res, body, attempt, state) {
       state.status = status;
 
       upstreamRes.on('error', (e) => {
+        if (idleTimer) clearTimeout(idleTimer);
         if (!res.writableEnded) res.destroy();
-        done({ ok: false, why: `upstream stream: ${e.message}` });
+        // v5.0.1 修复：keep-alive 连接被上游回收时，即使响应体已经完整收下，
+        // 这里也会收到一次 `aborted`。旧逻辑一律记成失败，于是成功请求的日志行
+        // 也挂上 ERR:upstream stream: aborted（实测 79 条，全是误报），
+        // 「一眼看出卡在哪」就失效了。res.complete 才是判据：
+        //   完整拿到响应体（含 chunked 收尾）→ true，这是正常结束，不是故障；
+        //   中途断掉 → false，才是真截断。
+        done(upstreamRes.complete
+          ? { ok: true }
+          : { ok: false, why: `upstream stream: ${e.message}` });
       });
-      upstreamRes.on('end', () => { if (!res.writableEnded) res.end(); done({ ok: true }); });
+      upstreamRes.on('end', () => { if (idleTimer) clearTimeout(idleTimer); if (!res.writableEnded) res.end(); done({ ok: true }); });
+
+      // v5.0.1 新增：响应头到手之后的静默兜底。
+      // 旧逻辑只有 FIRST_BYTE_TIMEOUT，而它带 `if (!forwarded)` —— 头一到就永久失效；
+      // socket 的空闲超时又是 0（关闭）。于是「头回来了、流吐了两口就停住」这种
+      // 最难受的处境完全没有兜底：请求永远挂着，客户端只能自己超时。
+      // 现在改成活动看门狗：每收到一块数据就重置，超过 IDLE_TIMEOUT 一个字节都没有才动手。
+      // 长思考不受影响 —— 它是在持续输出（思考也算数据），不是静默。
+      if (IDLE_TIMEOUT > 0) {
+        const bumpIdle = () => {
+          clearTimeout(idleTimer);
+          idleTimer = setTimeout(() => {
+            if (res.writableEnded) return;
+            console.log(`[idle] 上游 ${Math.round(IDLE_TIMEOUT / 1000)} 秒没有任何输出，掐掉这条流`);
+            upstreamRes.destroy(new Error(`idle ${Math.round(IDLE_TIMEOUT / 1000)}s`));
+            if (!res.writableEnded) res.destroy();
+            done({ ok: false, why: `upstream idle ${Math.round(IDLE_TIMEOUT / 1000)}s` });
+          }, IDLE_TIMEOUT);
+        };
+        upstreamRes.on('data', bumpIdle);
+        bumpIdle();
+      }
 
       // 一边转发一边偷看：把 reasoning_content 存起来备用，400 时把请求体落盘。
       // 偷看有上限（4MB），超了就不再收集，转发不受影响。
@@ -631,14 +712,22 @@ function onceAttempt(req, res, body, attempt, state) {
     }, FIRST_BYTE_TIMEOUT);
 
     upstreamReq.on('socket', (socket) => {
-      const mark = () => clearTimeout(connectTimer);
-      // v4.1 修复：走 CONNECT 隧道时，TunnelHttpsAgent 交回来的 socket 已经连好并完成 TLS，
-      // connect / secureConnect 早就触发过了，这两个 once 永远不会再响 —— 计时器也永远不清。
-      // 结果：上游只要 30 秒内没吐响应头（长思考、长任务排队），请求就会被代理自己杀掉，
-      // 报成 502 connect timeout，看起来像网络断。所以这里先按当前状态判一次。
+      // v5.0.1 修复：这两个 once 挂在**复用**的 keep-alive socket 上，而它早就连好了，
+      // 事件永远不会再响 —— 监听器却一直留在 socket 上，每来一个请求就多挂两个。
+      // 实测累计 350 次 MaxListenersExceededWarning（10-21 至 10-30），而且清不掉
+      // 连接计时器。改成：先按当前状态判一次，只在确实还没连上的连接上才挂。
+      const mark = () => {
+        clearTimeout(connectTimer);
+        socket.removeListener('connect', mark);
+        socket.removeListener('secureConnect', mark);
+      };
+      // v4.1 的教训：走 CONNECT 隧道时，TunnelHttpsAgent 交回来的 socket 已经连好并完成 TLS，
+      // connect / secureConnect 早就触发过了。所以这里必须先判状态，不能只挂监听。
       if (!socket.connecting) mark();
-      socket.once('connect', mark);
-      socket.once('secureConnect', mark);
+      else {
+        socket.once('connect', mark);
+        socket.once('secureConnect', mark);
+      }
 
       // 直连模式的抖动闸门：只对"https 且这条 socket 还没握手完"的情况生效。
       // 跨境直连的 TLS 握手会在 0.5s 与 12s 之间乱跳，超预算就掐掉交给外层重试。
@@ -661,6 +750,7 @@ function onceAttempt(req, res, body, attempt, state) {
     upstreamReq.on('error', (e) => {
       clearTimeout(connectTimer);
       if (firstByteTimer) clearTimeout(firstByteTimer);
+      if (idleTimer) clearTimeout(idleTimer);
       const code = e.code || e.message;
       if (state.clientGone) return done({ ok: false, why: 'client aborted' });
       if (!forwarded && RETRYABLE.has(code) && attempt < RETRIES) {
@@ -692,15 +782,19 @@ const sessionLabels = new Map();   // 会话身份 -> 人看得懂的标签
 // 浏览器打开 http://127.0.0.1:8787/ 就能一眼看完。
 const STARTED_AT = Date.now();
 // 版本号三段式（主.次.修）：加功能升次版本，只改错升修订，破坏性改动升主版本。
-const VERSION = '5.0.0';
+const VERSION = '5.0.2';
 const RECENT_MAX = 200;
 const recent = [];
 const stat = { total: 0, ok: 0, fail: 0, repaired: 0, filled: 0 };
 
 function recordEvent(ev) {
   stat.total++;
+  // 「状态码 2xx」不等于「这次成功」。响应头一发出就是 200，
+  // 之后流被截断（真断、或看门狗掐掉）时客户端其实只拿到半截回答。
+  // 以前这种也算 ok，成功率因此虚高，失败率被压掉——这跟误报是同一个病的两面。
+  const truncated = Boolean(ev.why) && !ev.aborted;
   if (ev.aborted) { /* 客户端自己断的，不算失败 */ }
-  else if (ev.status >= 200 && ev.status < 300) stat.ok++;
+  else if (ev.status >= 200 && ev.status < 300 && !truncated) stat.ok++;
   else stat.fail++;
   if (ev.injected) stat.repaired += ev.injected;
   if (ev.filled) stat.filled += ev.filled;
@@ -960,7 +1054,7 @@ async function relay(req, res, body) {
   if (GZIP && body && body.length > 4096) {
     try { sendBody = zlib.gzipSync(body); } catch { sendBody = body; }
   }
-  const state = { clientGone: false, upstreamReq: null, session: info.session, injected: repaired.injected, filled: repaired.filled || 0, dropped: repaired.dropped || 0, gzipped: sendBody !== body, rawBody: body };
+  const state = { clientGone: false, upstreamReq: null, session: info.session, injected: repaired.injected, filled: repaired.filled || 0, dropped: repaired.dropped || 0, gzipped: sendBody !== body, rawBody: body, bytes: sendBody ? sendBody.length : 0 };
   const sidKey = state.session || DEFAULT_SESSION;
   if (info.label && !sessionLabels.has(sidKey)) sessionLabels.set(sidKey, info.label);
   const taskKey = ++taskSeq;
@@ -998,18 +1092,21 @@ async function relay(req, res, body) {
   }
 
   const ms = Date.now() - started;
+  // 请求体大小一定要记：厚历史会话卡死时，唯一能自带判断的就是"这次发了多大"。
+  // 以前日志里一个字都没有，事后只能靠猜，也就没法证明是体积问题。
+  const kb = !state.bytes ? '-' : (state.bytes < 1024 ? state.bytes + 'B' : (state.bytes / 1024).toFixed(0) + 'KB');
   recordEvent({
     at: started, ms, method: req.method, path: req.url,
-    status: state.status ?? 0, injected: state.injected || 0, filled: state.filled || 0, dropped: state.dropped || 0, gzipped: state.gzipped || false,
+    status: state.status ?? 0, injected: state.injected || 0, filled: state.filled || 0, dropped: state.dropped || 0, gzipped: state.gzipped || false, bytes: state.bytes || 0,
     label: sessionLabels.get(sidKey) || sidKey.slice(0, 8),
     why: aborted ? '客户端断开' : (lastWhy || ''), aborted,
   });
   if (aborted) {
-    console.log(`[${ms}ms] ${req.method} ${req.url} ABORTED-BY-CLIENT (upstream stopped)`);
+    console.log(`[${ms}ms] ${req.method} ${req.url} body=${kb} ABORTED-BY-CLIENT (upstream stopped)`);
   } else {
     const sid = (req.headers['x-wb-session'] || state.session || DEFAULT_SESSION).slice(0, 8);
     // 把状态码写进日志：出问题时"上游回了什么"比"跑了多久"更有用。
-    console.log(`[${ms}ms] ${req.method} ${req.url} session=${sid} status=${state.status ?? '-'}${state.injected ? ` 补思考=${state.injected}` : ''}${state.filled ? ` 占位=${state.filled}` : ''}${state.dropped ? ` 丢空壳=${state.dropped}` : ''}${state.gzipped ? ' gz' : ''}${lastWhy ? ` ERR:${lastWhy}` : ''}`);
+    console.log(`[${ms}ms] ${req.method} ${req.url} session=${sid} body=${kb} status=${state.status ?? '-'}${state.injected ? ` 补思考=${state.injected}` : ''}${state.filled ? ` 占位=${state.filled}` : ''}${state.dropped ? ` 丢空壳=${state.dropped}` : ''}${state.gzipped ? ' gz' : ''}${lastWhy ? ` ERR:${lastWhy}` : ''}`);
   }
 }
 
