@@ -14,14 +14,18 @@
  * 所以不会每个请求都重开隧道。
  *
  * 环境变量（新增的在前）：
- *   PROXY_URL           出站代理，默认 http://127.0.0.1:7890；填 direct 则直连
+ *   PROXY_URL           出站代理；填 direct 则直连。不填则自动发现（见下）
+ *   PROXY_AUTODETECT    默认开；填 0 表示只认 PROXY_URL，不去猜常见端口
+ *   PROXY_CANDIDATES    自动探测的端口列表，逗号分隔
+ *   PROXY_WATCHDOG      默认开；填 0 关掉每分钟的出站复核
  *   PORT                默认 8787
  *   UPSTREAM_BASE       默认 https://opencode.ai/inference/go
  *   OPENCODE_SESSION    默认每次启动随机 UUID
  *   PROXY_RETRIES       连接阶段失败重试次数，默认 3
  *   CONNECT_TIMEOUT_MS  连接建立超时，默认 30000
- *   IDLE_TIMEOUT_MS     上游静默超时，默认 0（不限制）
- *   KEEPALIVE_TIMEOUT_MS 客户端空闲连接保留时长，默认 0（不主动关闭）
+ *   FIRST_BYTE_TIMEOUT_MS 上游一个字节都不回的上限，默认 420000
+ *   IDLE_TIMEOUT_MS     响应头到手后连续无输出多久算死，默认 300000；0 不限制
+ *   KEEPALIVE_TIMEOUT_MS 客户端空闲连接回收时长，默认 65000；0 不回收
  */
 
 import http from 'node:http';
@@ -190,22 +194,209 @@ const GZIP = process.env.GZIP === '1';
 // 又保证关掉的会话最终会被收走。填 0 仍然恢复旧行为（不回收）。
 const KEEPALIVE_TIMEOUT = Number(process.env.KEEPALIVE_TIMEOUT_MS ?? 65000);
 
-const RAW_PROXY = (process.env.PROXY_URL || 'http://127.0.0.1:7890').trim();
 // 直连模式下，TLS 握手超过预算就当作"这条路抖了"，掐掉换一次。
 // 实测直连 opencode.ai 的握手会在 0.5s 和 11.8s 之间乱跳，重试通常能换到快的那条。
 // 预算按尝试次数递增，最后一次不再掐：只抢一次快路，抢不到就老实等，
 // 免得"本来就慢但能成"的请求被反复掐成失败。
 const TLS_BUDGETS = (process.env.TLS_BUDGET_MS || '5000,15000,0')
   .split(',').map((x) => Number(x.trim())).filter((x) => Number.isFinite(x));
-let PROXY = null;
-if (RAW_PROXY && RAW_PROXY.toLowerCase() !== 'direct') {
+
+// ——— 出站代理：发现 + 验证 ———
+// 旧版只做一件事：往写死的 127.0.0.1:7890 开一个 TCP 连接，连上就当代理可用。
+// 实测这个方法会两个方向都判错：
+//   ① 端口开着但根本出不去 → 判「经代理」（用户以为走了 VPN，其实在裸奔）；
+//   ② 用户的代理在别的端口 → 判「直连」（明明能走却不走，白扛跨境抖动）。
+// 现在改成两件事分开做：
+//   discoverProxy()  按优先级找到"该用哪个"，不再只认 7890；
+//   verifyProxy()    真发一个 CONNECT 并等回应，验的是"能不能出网"，不是"门开没开"。
+const PROXY_CANDIDATES = (process.env.PROXY_CANDIDATES
+  || '7890,7897,10809,10808,1087,1080,8889,6152,6153,8118,8080,10801')
+  .split(',').map((x) => Number(x.trim())).filter((n) => Number.isFinite(n) && n > 0);
+
+// 一个候选的描述：{ host, port, from }；from 说明是哪条线索找到的，界面要显示。
+function parseProxySpec(spec) {
+  const s = String(spec || '').trim();
+  if (!s) return null;
   try {
-    const u = new URL(RAW_PROXY.includes('://') ? RAW_PROXY : 'http://' + RAW_PROXY);
-    PROXY = { host: u.hostname, port: Number(u.port || 7890) };
-  } catch { PROXY = null; }
+    const u = new URL(s.includes('://') ? s : 'http://' + s);
+    // 本项目只支持 HTTP 代理（走 CONNECT）。socks 判出来也没法用，明确挡掉别装作支持。
+    if (u.protocol && !/^https?:$/.test(u.protocol)) return null;
+    const port = Number(u.port || (u.protocol === 'https:' ? 443 : 80));
+    if (!u.hostname || !port) return null;
+    return { host: u.hostname, port };
+  } catch { return null; }
 }
-// 启动探测后可能翻成 true（代理端口没开时不用隧道，直接走直连）
-let OUTBOUND_DIRECT = !PROXY;
+
+// 候选来源按优先级排。前面的是"用户明说了"，后面的是"猜的"，猜出来的要在界面标出来。
+function proxyCandidates() {
+  const out = [];
+  const push = (spec, from) => {
+    const p = parseProxySpec(spec);
+    if (!p) return;
+    if (out.some((x) => x.host === p.host && x.port === p.port)) return;
+    out.push({ ...p, from });
+  };
+
+  const explicit = String(process.env.PROXY_URL ?? '').trim();
+  // PROXY_URL=direct 是明确的"别用代理"，直接短路，不去猜
+  if (/^direct$/i.test(explicit)) return [];
+  if (explicit) push(explicit, 'PROXY_URL');
+
+  // 环境变量里最常见的一批。Node 自己的 http.request 不读它们，
+  // 但用户设了就是告诉我们代理在哪——旧版完全没看这一层。
+  for (const k of ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'ALL_PROXY', 'all_proxy']) {
+    const v = String(process.env[k] || '').trim();
+    if (v && !/^direct$/i.test(v)) push(v, k);
+  }
+
+  if (process.env.PROXY_AUTODETECT !== '0') {
+    for (const port of PROXY_CANDIDATES) push('http://127.0.0.1:' + port, 'common port');
+  }
+  return out;
+}
+
+// 真发一个 CONNECT，**并且**在隧道里再走一步 TLS 握手。
+// 只验 CONNECT 回 200 是不够的：假的/坏掉的代理也会立刻回 200（实测过），
+// 它只是谎报"隧道建好了"，后面一个字节都出不去。必须在隧道里真握一次手，
+// 才算证明了"这条路能把流量送到上游"。
+//
+// 边界要说清：这里证明的是「隧道通到上游」，**不是**「你的钥匙有效」。
+// 后者得发业务请求才知道，代价太大，不能每分钟做一次。所以这一层只回答
+// "走代理还是走直连"；钥匙对不对，仍由真实请求的 401/402 暴露。
+function verifyProxy(cand, timeoutMs) {
+  return new Promise((resolve) => {
+    let settled = false;
+    let sock = null;
+    let tlsSock = null;
+    const kill = () => {
+      try { if (tlsSock) tlsSock.destroy(); } catch { /* 已断 */ }
+      try { if (sock) sock.destroy(); } catch { /* 已断 */ }
+    };
+    const fin = (ok, detail) => {
+      if (settled) return;
+      settled = true;
+      kill();
+      resolve({ ok, detail });
+    };
+
+    let targetHost = 'example.com';
+    let targetPort = 443;
+    try {
+      const u = new URL(UPSTREAM);
+      targetHost = u.hostname;
+      targetPort = Number(u.port || (u.protocol === 'https:' ? 443 : 80));
+    } catch { /* 用兜底目标 */ }
+
+    try {
+      sock = net.connect(cand.port, cand.host);
+    } catch (e) {
+      return fin(false, e.code || e.message);
+    }
+    sock.setTimeout(timeoutMs);
+    sock.once('timeout', () => fin(false, 'connect timeout'));
+    sock.once('error', (e) => fin(false, e.code || e.message));
+    sock.once('connect', () => {
+      const host = `${targetHost}:${targetPort}`;
+      sock.write(`CONNECT ${host} HTTP/1.1\r\nHost: ${host}\r\n\r\n`);
+    });
+
+    let buf = '';
+    sock.on('data', (d) => {
+      if (settled) return;
+      buf += d.toString('latin1');
+      const m = /^HTTP\/\d\.\d (\d{3})/.exec(buf);
+      if (!m) {
+        if (buf.length > 4096) fin(false, 'bad response');
+        return;
+      }
+      const code = Number(m[1]);
+      if (code !== 200) return fin(false, 'CONNECT HTTP ' + code);
+      // 隧道声称建好了：把 CONNECT 之后可能已经跟来的字节摘出来，剩下走 TLS。
+      const headEnd = buf.indexOf('\r\n\r\n');
+      const leftover = headEnd >= 0 ? Buffer.from(buf.slice(headEnd + 4), 'latin1') : null;
+      sock.removeAllListeners('data');
+      // 这条 socket 的 timeout 也要摘掉：不摘的话它会在 TLS 阶段先响，
+      // 报出来的原因是「connect timeout」，把真实原因（TLS 没握上）盖住。
+      sock.removeAllListeners('timeout');
+      sock.on('error', () => { /* 交由 TLS 层报 */ });
+
+      // 上游是 https 才做 TLS；http 上游就在隧道里发一个 HEAD，看有没有回应。
+      if (targetPort === 443) {
+        try {
+          tlsSock = tls.connect({ socket: sock, servername: targetHost, rejectUnauthorized: false });
+        } catch (e) { return fin(false, 'tls init: ' + (e.code || e.message)); }
+        tlsSock.setTimeout(timeoutMs);
+        tlsSock.once('secureConnect', () => fin(true, 'CONNECT 200 + TLS 握手成功'));
+        tlsSock.once('timeout', () => fin(false, 'tls timeout'));
+        tlsSock.once('error', (e) => fin(false, 'tls: ' + (e.code || e.message)));
+        if (leftover && leftover.length) tlsSock.write(leftover);
+      } else {
+        // 明文上游：发一个最小请求，等首行
+        sock.write(`HEAD / HTTP/1.0\r\nHost: ${targetHost}\r\n\r\n`);
+        if (leftover && leftover.length) {
+          if (/^HTTP\/\d/.test(leftover.toString('latin1'))) return fin(true, 'CONNECT 200 + 有回应');
+        }
+        let got = '';
+        sock.on('data', (x) => {
+          got += x.toString('latin1');
+          if (/^HTTP\/\d/.test(got)) fin(true, 'CONNECT 200 + 有回应');
+        });
+        sock.once('timeout', () => fin(false, 'no response in tunnel'));
+        sock.once('close', () => fin(false, 'tunnel closed without response'));
+      }
+    });
+  });
+}
+
+// 启动/看门狗共用的结论：状态只有三种，别再把"看着像"混进"是"里。
+//   proxy   找到并验证过能出网
+//   direct  没有可用代理，走直连
+//   broken  端口开着（或用户指定了）但业务上出不去 —— 这才是真要报警的
+let OUTBOUND = { mode: 'direct', proxy: null, detail: '', checkedAt: 0 };
+// 旧代码到处读这两个，保持一致：PROXY 只在真验证通过后才非空。
+let PROXY = null;
+let OUTBOUND_DIRECT = true;
+
+function describeOutbound() {
+  if (OUTBOUND.mode === 'proxy') {
+    return `经代理 ${OUTBOUND.proxy.host}:${OUTBOUND.proxy.port}` +
+      (OUTBOUND.proxy.from && OUTBOUND.proxy.from !== 'PROXY_URL' ? `（自动发现：${OUTBOUND.proxy.from}）` : '');
+  }
+  if (OUTBOUND.mode === 'broken') {
+    // 「不开」和「开着但出不去」是两件事，别混。用户看到这句才知道该查哪里。
+    return `代理不通（端口开着但出不去）：${OUTBOUND.detail}`;
+  }
+  return '直连（没找到可用代理）';
+}
+
+async function resolveOutbound() {
+  const cands = proxyCandidates();
+  if (!cands.length) {
+    return { mode: 'direct', proxy: null, detail: 'PROXY_URL=direct', checkedAt: Date.now() };
+  }
+  const broken = [];
+  for (const c of cands) {
+    const r = await verifyProxy(c, 1200);
+    if (r.ok) return { mode: 'proxy', proxy: c, detail: 'CONNECT 200', checkedAt: Date.now() };
+    // 用户自己点名的那条连不上，要单独记下来：这不是"没代理"，是"你给的代理不通"
+    if (c.from === 'PROXY_URL' || (c.from && /PROXY$/i.test(c.from))) broken.push(`${c.host}:${c.port} ${r.detail}`);
+  }
+  return {
+    mode: broken.length ? 'broken' : 'direct',
+    proxy: null,
+    detail: broken.length ? broken.join('；') : '候选端口都不通',
+    checkedAt: Date.now(),
+  };
+}
+
+// 把结论落到全局。PROXY 必须跟 OUTBOUND.proxy 同步——
+// openTunnel 读的是 PROXY，忘了同步就会出现"状态显示走了代理、实际还在用旧值/空值"。
+function applyOutbound(r) {
+  OUTBOUND = r;
+  PROXY = r.mode === 'proxy' ? r.proxy : null;
+  OUTBOUND_DIRECT = r.mode !== 'proxy';
+  buildAgents(!OUTBOUND_DIRECT);
+}
 
 const DEFAULT_SESSION = process.env.OPENCODE_SESSION || randomUUID();
 
@@ -309,18 +500,6 @@ function buildAgents(useProxy) {
   AGENTS = useProxy
     ? { 'http:': new HttpAgent({ keepAlive: true, maxSockets: 64 }), 'https:': new TunnelHttpsAgent({ keepAlive: true, maxSockets: 32 }) }
     : { 'http:': new HttpAgent({ keepAlive: true, maxSockets: 64 }), 'https:': new HttpsAgent({ keepAlive: true, maxSockets: 64 }) };
-}
-
-function probeProxy(host, port, timeoutMs) {
-  return new Promise((resolve) => {
-    const sock = new net.Socket();
-    const finish = (ok) => { try { sock.destroy(); } catch {} resolve(ok); };
-    sock.setTimeout(timeoutMs);
-    sock.once('connect', () => finish(true));
-    sock.once('timeout', () => finish(false));
-    sock.once('error', () => finish(false));
-    sock.connect(port, host);
-  });
 }
 
 function buildHeaders(incoming) {
@@ -782,7 +961,7 @@ const sessionLabels = new Map();   // 会话身份 -> 人看得懂的标签
 // 浏览器打开 http://127.0.0.1:8787/ 就能一眼看完。
 const STARTED_AT = Date.now();
 // 版本号三段式（主.次.修）：加功能升次版本，只改错升修订，破坏性改动升主版本。
-const VERSION = '5.0.2';
+const VERSION = '5.0.3';
 const RECENT_MAX = 200;
 const recent = [];
 const stat = { total: 0, ok: 0, fail: 0, repaired: 0, filled: 0 };
@@ -885,8 +1064,10 @@ function drawTui() {
   const key = (k) => C.gray + fit(k, KEYW) + C.reset;
   const bar = `${C.gray}│${C.reset}`;
 
-  const obPlain = OUTBOUND_DIRECT ? '直连' : ('经代理 ' + (PROXY ? PROXY.host + ':' + PROXY.port : ''));
-  const obColor = OUTBOUND_DIRECT ? C.yellow + obPlain + C.reset : C.green + obPlain + C.reset;
+  // 三种状态各自的颜色：代理绿、直连黄、代理不开红（这才是要动手的那一种）
+  const obPlain = describeOutbound();
+  const obColor = OUTBOUND.mode === 'proxy' ? C.green + obPlain + C.reset
+    : (OUTBOUND.mode === 'broken' ? C.red + obPlain + C.reset : C.yellow + obPlain + C.reset);
   const idlePlain = lastAt ? agoText(idle) : '还没收到';
   const idleColor = lastAt ? C.bold + idlePlain + C.reset : C.gray + idlePlain + C.reset;
 
@@ -1122,8 +1303,12 @@ const server = http.createServer((req, res) => {
     return res.end(JSON.stringify({
       version: VERSION, uptimeMs: Date.now() - STARTED_AT,
       hasKey: Boolean(ENV_KEY), localToken: Boolean(LOCAL_TOKEN),
-      outbound: OUTBOUND_DIRECT ? 'direct' : 'proxy',
+      outbound: OUTBOUND.mode,
+      outboundText: describeOutbound(),
+      outboundDetail: OUTBOUND.detail || '',
+      outboundCheckedAt: OUTBOUND.checkedAt || 0,
       proxy: PROXY ? `${PROXY.host}:${PROXY.port}` : '',
+      proxyFrom: PROXY ? (PROXY.from || '') : '',
       upstream: UPSTREAM, total: stat.total, ok: stat.ok, fail: stat.fail,
       repaired: stat.repaired, lastAt,
       inflight: [...inflight.values()].reduce((a, b) => a + b, 0),
@@ -1137,7 +1322,9 @@ const server = http.createServer((req, res) => {
     return res.end(JSON.stringify({
       ok: true, version: VERSION, upstream: UPSTREAM, hasKey: Boolean(ENV_KEY),
       localToken: Boolean(LOCAL_TOKEN),
-      outbound: OUTBOUND_DIRECT ? 'direct' : `proxy ${PROXY.host}:${PROXY.port}`,
+      outbound: OUTBOUND.mode,
+      outboundText: describeOutbound(),
+      outboundDetail: OUTBOUND.detail || '',
       retries: RETRIES, idleTimeout: IDLE_TIMEOUT,
       connectTimeout: CONNECT_TIMEOUT, keepAliveTimeout: KEEPALIVE_TIMEOUT,
     }));
@@ -1158,29 +1345,40 @@ server.requestTimeout = 0;
 server.timeout = 0;
 
 (async () => {
-  if (PROXY) {
-    const alive = await probeProxy(PROXY.host, PROXY.port, 800);
-    if (!alive) {
-      console.log(`[warn] 出站代理 ${PROXY.host}:${PROXY.port} 连不上，本次直接走直连。`);
-      console.log('[warn] 能用，但跨境抖动会明显变大；想要稳，请先把网络代理开起来再重启我。');
-      OUTBOUND_DIRECT = true;
+  // 出站：先按优先级找候选，再真发 CONNECT 验证。不再"探一下 7890 的端口开没开"。
+  const first = await resolveOutbound();
+  applyOutbound(first);
+
+  if (first.mode === 'proxy') {
+    const via = first.proxy.from && first.proxy.from !== 'PROXY_URL'
+      ? `（自动发现，线索：${first.proxy.from}）` : '（PROXY_URL 指定）';
+    console.log(`[outbound] 经代理 ${first.proxy.host}:${first.proxy.port}，CONNECT 已验证能出网${via}`);
+  } else if (first.mode === 'broken') {
+    // 这条要喊出来：端口开着/用户指定了，但真发请求出不去。比"没代理"更危险——
+    // 用户以为在走 VPN，其实每个请求都在裸奔。
+    console.log(`[warn] 你指定/存在一个代理端口，但它出不了网：${first.detail}`);
+    console.log('[warn] 已回退直连。跨境抖动会明显变大，请检查代理客户端是否真的在转发。');
+  } else {
+    console.log('[outbound] 没找到可用代理，走直连。');
+    if (proxyCandidates().length === 0) {
+      console.log('[warn] 未配置任何代理（PROXY_URL=direct）。若必须走 VPN，请设 PROXY_URL。');
+    } else {
+      console.log('[warn] 常见代理端口都试过了，都不通。要用 VPN 请确认代理客户端已启动。');
     }
   }
-  buildAgents(!OUTBOUND_DIRECT);
 
   // 常驻模式下的看门狗：出站走哪条路，启动那一刻定的不算数。
   // 挂着跑一整天，VPN 会中途起落；每分钟复核一次，状态真的翻了才换 agent 并记一笔，
   // 不让"开机时 VPN 没起"变成一整天的直连抖动。PROXY_WATCHDOG=0 可关。
-  if (PROXY && process.env.PROXY_WATCHDOG !== '0') {
-    let last = null;
+  if (process.env.PROXY_WATCHDOG !== '0') {
     setInterval(async () => {
-      const alive = await probeProxy(PROXY.host, PROXY.port, 800);
-      if (last === null) { last = alive; return; }
-      if (alive === last) return;
-      last = alive;
-      OUTBOUND_DIRECT = !alive;
-      buildAgents(!OUTBOUND_DIRECT);
-      console.log(`[switch] 出站改走 ${alive ? '代理 ' + PROXY.host + ':' + PROXY.port : '直连'}`);
+      const r = await resolveOutbound();
+      if (r.mode === OUTBOUND.mode
+          && (r.proxy && OUTBOUND.proxy ? (r.proxy.host === OUTBOUND.proxy.host && r.proxy.port === OUTBOUND.proxy.port) : r.proxy === OUTBOUND.proxy)) {
+        return;
+      }
+      applyOutbound(r);
+      console.log(`[switch] 出站改走 ${describeOutbound()}`);
       drawTui();
     }, 60000);
   }
@@ -1188,7 +1386,7 @@ server.timeout = 0;
   server.listen(PORT, HOST, () => {
     console.log(`OpenCode Go proxy v${VERSION} -> ${UPSTREAM}`);
     console.log(`listening http://${HOST}:${PORT}`);
-    console.log(`outbound ${OUTBOUND_DIRECT ? 'DIRECT (no proxy)' : `via proxy ${PROXY.host}:${PROXY.port}`}`);
+    console.log(`outbound ${OUTBOUND.mode.toUpperCase()} ${OUTBOUND.mode === 'proxy' ? `via ${PROXY.host}:${PROXY.port}` : `(${OUTBOUND.detail})`}`);
     console.log(`session  ${DEFAULT_SESSION}`);
     console.log(`retries ${RETRIES} | gzip ${GZIP ? 'ON' : 'off'} | connectTimeout ${CONNECT_TIMEOUT}ms | tlsBudget ${TLS_BUDGETS.join('/')}ms | idleTimeout ${IDLE_TIMEOUT || 'unlimited'} | keepAliveTimeout ${KEEPALIVE_TIMEOUT || 'unlimited'}`);
     // 本项目不读、不存密钥：钥匙由客户端每次请求带来。
