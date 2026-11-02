@@ -377,11 +377,19 @@ def draw_main(W, H):
         kv('已运行', '--:--:--', DIM)
     else:
         kv('上游地址', cut(str(d.get('upstream', '-')), max(10, W - 22)), WHITE)
+        # 出站三态：别的分支都不敢把它当"有代理"，否则就把「端口开着但出不去」
+        # 说成了「经本地代理」——那正是要报警的那一种。
         ob = d.get('outbound', '')
-        if ob == 'direct':
-            kv('出站方式', '直连（没走本地代理）', WHITE)
+        ob_text = d.get('outboundText') or ''
+        if ob == 'proxy':
+            kv('出站方式', cut(ob_text or ('经本地代理 %s' % (d.get('proxy') or '-')),
+                               max(10, W - 22)), GREEN)
+        elif ob == 'broken':
+            kv('出站方式', cut(ob_text or '代理不通', max(10, W - 22)), RED,
+               '已回退直连，查代理客户端', YELLOW)
         else:
-            kv('出站方式', '经本地代理 %s' % (d.get('proxy') or '-'), WHITE)
+            kv('出站方式', cut(ob_text or '直连（没走本地代理）', max(10, W - 22)), YELLOW,
+               '没找到可用代理', DIM)
         kv('已运行', hms(d.get('uptimeMs', 0)), WHITE,
            '刷新 ' + time.strftime('%H:%M:%S'))
 
