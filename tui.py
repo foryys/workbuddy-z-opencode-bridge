@@ -427,7 +427,7 @@ def draw_main(W, H):
     avail = max(1, H - len(out) - 4)
 
     hl = L().add(' ').add(pad('时间', 10), GREY).add(' ')
-    hl.add(pad('方法', 7), GREY).add(pad('路径', 26), GREY)
+    hl.add(pad('方法', 7), GREY).add(pad('路径', 16), GREY).add(pad('体积', 8), GREY)
     # 右侧三列和数据行用同一套宽度：状态 4 + 间隔 4 + 耗时 7
     gap = inner - (hl.w + 15)
     hl.add(' ' * max(2, gap)).add('状态', GREY).add('    ').add('  耗时', GREY)
@@ -446,9 +446,13 @@ def draw_main(W, H):
             ts = datetime.fromtimestamp(item.get('at', 0) / 1000).strftime('%H:%M:%S')
             code = item.get('status', 0)
             ms = '%dms' % item.get('ms', 0)
+            # 请求体大小：厚历史会话卡死时，这一列是唯一能自己判断"是不是发太大了"的依据
+            nbytes = item.get('bytes') or 0
+            size = ('%.0fK' % (nbytes / 1024.0)) if nbytes >= 1024 else ('%dB' % nbytes if nbytes else '-')
             l = L().add(' ').add(pad(ts, 10), FAINT).add(' ')
             l.add(pad(item.get('method', ''), 7), TEAL)
-            l.add(cut(item.get('path', ''), 24), GREY)
+            l.add(pad(cut(item.get('path', ''), 14), 16), GREY)
+            l.add(pad(size, 8), DIM)
             right_w = 4 + 4 + 7
             gap = inner - (l.w + right_w)
             l.add(' ' * max(2, gap))
@@ -700,12 +704,16 @@ def copy_access():
     cfg = ST['cfg']
     st = upstream_state()
     ok = C.copy_text(C.access_block(cfg))
-    if st == 'legacy':
+    # 顺序要紧：先判成没成，再补处境提醒。
+    # 反过来写的话，剪贴板被别的程序占着时也会说「复制了」，
+    # 用户拿着空剪贴板去粘，然后一头雾水——与 10-28 修过的
+    # 「保存失败也提示成功」是同一类错。
+    if not ok:
+        flash('复制失败：剪贴板被别的程序占着，再按一次 [Y]')
+    elif st == 'legacy':
         flash('复制了。但那栏是旧版本令牌、本项目已不签发 —— 改成 opencode 真钥匙', 12.0)
     elif st == 'nokey':
         flash('复制了，但 WorkBuddy 那栏还空着 —— 填上 opencode 的真钥匙才能用', 12.0)
-    elif not ok:
-        flash('复制失败：剪贴板被别的程序占着，再按一次 [Y]')
     elif ST['off']:
         flash('已复制。但代理没在跑，粘过去也连不上 —— 先双击桌面图标', 9.0)
     else:
