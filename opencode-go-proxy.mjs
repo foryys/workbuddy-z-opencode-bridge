@@ -357,14 +357,16 @@ let OUTBOUND = { mode: 'direct', proxy: null, detail: '', checkedAt: 0 };
 let PROXY = null;
 let OUTBOUND_DIRECT = true;
 
-function describeOutbound() {
-  if (OUTBOUND.mode === 'proxy') {
-    return `经代理 ${OUTBOUND.proxy.host}:${OUTBOUND.proxy.port}` +
-      (OUTBOUND.proxy.from && OUTBOUND.proxy.from !== 'PROXY_URL' ? `（自动发现：${OUTBOUND.proxy.from}）` : '');
+function describeOutbound(o) {
+  // 传参就描述那份（/diag 要拿刚测出来的结果说话），不传就描述当前在用的
+  const st = o || OUTBOUND;
+  if (st.mode === 'proxy') {
+    return `经代理 ${st.proxy.host}:${st.proxy.port}` +
+      (st.proxy.from && st.proxy.from !== 'PROXY_URL' ? `（自动发现：${st.proxy.from}）` : '');
   }
-  if (OUTBOUND.mode === 'broken') {
+  if (st.mode === 'broken') {
     // 「不开」和「开着但出不去」是两件事，别混。用户看到这句才知道该查哪里。
-    return `代理不通（端口开着但出不去）：${OUTBOUND.detail}`;
+    return `代理不通（端口开着但出不去）：${st.detail}`;
   }
   return '直连（没找到可用代理）';
 }
@@ -598,10 +600,14 @@ function deriveSessionInfo(body) {
 }
 
 // ——— 思考内容回填 ———
-// DeepSeek 思考模式要求：历史里每个 assistant 消息都要带上当初的 reasoning_content。
-// 客户端把这条模型当"通用自定义模型"（vendor=Custom），回传时不带，上游就时不时 400。
-// 代理这一层能补：上游吐出来的 reasoning_content 按"回答正文"存档；存档里没有的，
-// 塞一句占位——上游只校验这个字段在不在，不校验内容真伪，缺一条就整条请求被拒。
+// 原始假设是「DeepSeek 思考模式要求历史里每个 assistant 都带 reasoning_content，
+// 缺一条就整条请求被拒」。**2026-11-02 直接打上游实测，这个假设不成立**——
+// 详见 injectReasoning() 上面的记录：带不带、带空串、带假值，上游都回 200。
+//
+// 于是这一层的定位改了：
+//   存档（下面这套 Map）继续留着 —— 上游确实会吐 reasoning_content，
+//   把它按回答存档、下次原样回填，能让上游看到**真实的**上下文，这是实收益。
+//   但不再"补不出真值就塞占位" —— 那是在造假，而且实测根本不需要。
 const reasoningByText = new Map();
 const REASONING_CAP = 2000;
 const HASH_CACHE_FILE = path.join(process.cwd(), 'reasoning-cache.json');
@@ -726,15 +732,34 @@ function harvest(bufs, status) {
   remember(content, reasoning, toolCalls);
 }
 
+// v5.0.4：整层「补思考」按实测结论关掉。
+//
+// 这一层原本的假设是「DeepSeek 思考模式要求历史里每个 assistant 都带 reasoning_content，
+// 缺一条就整条请求 400」。**实测这个假设不成立**（2026-11-02，直接打上游）：
+//   · 不带该字段        → 200
+//   · 空字符串 ""       → 200
+//   · 短占位 "..."      → 200
+//   · 当前长占位        → 200
+//   · 假真值            → 200
+//   · 工具调用轮次（三种形态） → 200
+// 还用正常参数跑了一轮完整对话（max_tokens 300），历史 assistant 不带该字段，
+// 上游正常回 85 字正文 + 330 字思考。
+//
+// 也就是说：以前塞进去的 92 万条占位，上游根本不需要；它们唯一的实际后果是让
+// 上游看到一坨假思考，还白占请求体积（厚历史本来就在 2MB 上下）。
+// 现在保留两件事，第三件删掉：
+//   1. 空壳 assistant 剔除 —— 这条是真的（上游会 400：content or tool_calls must be set）
+//   2. 存档里有的真思考，回填进去 —— 让上游看到真实的上下文，是收益
+//   3. 存档里没有的，**不塞占位、也不塞空串** —— 直接不带这个字段（实测安全）
 const REASONING_PLACEHOLDER = '(reasoning omitted by local bridge)';
 
 function injectReasoning(buf) {
-  if (!buf || !buf.length) return { buf, injected: 0, filled: 0, dropped: 0 };
+  if (!buf || !buf.length) return { buf, injected: 0, filled: 0, dropped: 0, cleaned: 0 };
   let j;
-  try { j = JSON.parse(buf.toString('utf8')); } catch { return { buf, injected: 0, filled: 0, dropped: 0 }; }
-  if (!Array.isArray(j.messages)) return { buf, injected: 0, filled: 0, dropped: 0 };
+  try { j = JSON.parse(buf.toString('utf8')); } catch { return { buf, injected: 0, filled: 0, dropped: 0, cleaned: 0 }; }
+  if (!Array.isArray(j.messages)) return { buf, injected: 0, filled: 0, dropped: 0, cleaned: 0 };
 
-  // 先清掉"既无正文、也无工具调用"的空壳 assistant 消息。
+  // 清掉"既无正文、也无工具调用"的空壳 assistant 消息。
   // 这类多半是某次中断留下的，上游会直接 400：content or tool_calls must be set。
   let dropped = 0;
   const kept = [];
@@ -748,19 +773,29 @@ function injectReasoning(buf) {
   }
   if (dropped) j.messages = kept;
 
-  let injected = 0, filled = 0;
+  let injected = 0, cleaned = 0;
   for (const m of j.messages) {
     if (!m || m.role !== 'assistant') continue;
-    // 占位是我自己塞的，客户端会把它存进历史再回传；不认出来的话，真值永远换不回去
     const cur = m.reasoning_content;
-    if (typeof cur === 'string' && cur && cur !== REASONING_PLACEHOLDER) continue;
+    // 旧版本塞进去的占位，客户端会存进历史再回传。遇到就摘掉——
+    // 上游不需要它，留着只是把假内容一直发下去。
+    if (cur === REASONING_PLACEHOLDER) {
+      delete m.reasoning_content;
+      cleaned++;
+    }
+    // 已经是真值的不动
+    if (typeof m.reasoning_content === 'string' && m.reasoning_content) continue;
+    // 存档里有真思考就补进去（这是真收益：让上游看到真实上下文）
     const key = answerKey(m.content, m.tool_calls);
     const hit = key ? reasoningByText.get(hashText(key)) : null;
     if (hit) { m.reasoning_content = hit; injected++; }
-    else { m.reasoning_content = REASONING_PLACEHOLDER; filled++; }
+    // 存档里没有：什么都不加。实测上游接受，不伪造。
   }
-  if (!injected && !filled && !dropped) return { buf, injected: 0, filled: 0, dropped: 0 };
-  return { buf: Buffer.from(JSON.stringify(j), 'utf8'), injected, filled, dropped };
+  if (!injected && !dropped && !cleaned) {
+    // 没有真值可补、也没清理过，原样返回，不做一次无意义的重新序列化
+    return { buf, injected: 0, filled: 0, dropped: 0, cleaned: 0 };
+  }
+  return { buf: Buffer.from(JSON.stringify(j), 'utf8'), injected, filled: 0, dropped, cleaned };
 }
 
 // 上游回 400 时把这次请求体存下来：真实原因只能从原文里看出来
@@ -961,10 +996,10 @@ const sessionLabels = new Map();   // 会话身份 -> 人看得懂的标签
 // 浏览器打开 http://127.0.0.1:8787/ 就能一眼看完。
 const STARTED_AT = Date.now();
 // 版本号三段式（主.次.修）：加功能升次版本，只改错升修订，破坏性改动升主版本。
-const VERSION = '5.0.3';
+const VERSION = '5.0.4';
 const RECENT_MAX = 200;
 const recent = [];
-const stat = { total: 0, ok: 0, fail: 0, repaired: 0, filled: 0 };
+const stat = { total: 0, ok: 0, fail: 0, repaired: 0, filled: 0, cleaned: 0 };
 
 function recordEvent(ev) {
   stat.total++;
@@ -976,7 +1011,7 @@ function recordEvent(ev) {
   else if (ev.status >= 200 && ev.status < 300 && !truncated) stat.ok++;
   else stat.fail++;
   if (ev.injected) stat.repaired += ev.injected;
-  if (ev.filled) stat.filled += ev.filled;
+  if (ev.cleaned) stat.cleaned += ev.cleaned;
   recent.push(ev);
   if (recent.length > RECENT_MAX) {
     recent.shift();
@@ -1076,7 +1111,7 @@ function drawTui() {
   const okPlain = `成功 ${stat.ok} / ${stat.total}   失败 ${stat.fail}`;
   const runPlain = `运行 ${Math.round((now - STARTED_AT) / 60000)} 分钟`;
 
-  out.push(line(` ${key('出站')} ${obColor}${pad(s1Plain)} ${bar}   ${C.green}成功 ${stat.ok}${C.reset} / ${stat.total}   失败 ${stat.fail ? C.red + stat.fail + C.reset : '0'}${pad(okPlain)} ${bar}   补思考 ${stat.repaired}   占位 ${stat.filled}`));
+  out.push(line(` ${key('出站')} ${obColor}${pad(s1Plain)} ${bar}   ${C.green}成功 ${stat.ok}${C.reset} / ${stat.total}   失败 ${stat.fail ? C.red + stat.fail + C.reset : '0'}${pad(okPlain)} ${bar}   补思考 ${stat.repaired}   清占位 ${stat.cleaned}`));
   out.push(line(` ${key('最近请求')} ${idleColor}${pad(s2Plain)} ${bar}   运行 ${Math.round((now - STARTED_AT) / 60000)} 分钟${pad(runPlain)} ${bar}   存档 ${reasoningByText.size} 条   并发 ${activeTasks.size}`));
 
   const act = [...activeTasks.values()];
@@ -1109,7 +1144,7 @@ function drawTui() {
     if (e.status) bits.push('HTTP ' + e.status);
     if (e.gzipped) bits.push('压缩');
     if (e.injected) bits.push('补思考 ' + e.injected);
-    if (e.filled) bits.push('占位 ' + e.filled);
+    if (e.cleaned) bits.push('清占位 ' + e.cleaned);
     if (e.dropped) bits.push('丢空壳 ' + e.dropped);
     if (e.why && !e.aborted) bits.push(e.why);
     if (e.aborted) bits.push('客户端断开');
@@ -1235,7 +1270,7 @@ async function relay(req, res, body) {
   if (GZIP && body && body.length > 4096) {
     try { sendBody = zlib.gzipSync(body); } catch { sendBody = body; }
   }
-  const state = { clientGone: false, upstreamReq: null, session: info.session, injected: repaired.injected, filled: repaired.filled || 0, dropped: repaired.dropped || 0, gzipped: sendBody !== body, rawBody: body, bytes: sendBody ? sendBody.length : 0 };
+  const state = { clientGone: false, upstreamReq: null, session: info.session, injected: repaired.injected, cleaned: repaired.cleaned || 0, filled: 0, dropped: repaired.dropped || 0, gzipped: sendBody !== body, rawBody: body, bytes: sendBody ? sendBody.length : 0 };
   const sidKey = state.session || DEFAULT_SESSION;
   if (info.label && !sessionLabels.has(sidKey)) sessionLabels.set(sidKey, info.label);
   const taskKey = ++taskSeq;
@@ -1273,21 +1308,26 @@ async function relay(req, res, body) {
   }
 
   const ms = Date.now() - started;
-  // 请求体大小一定要记：厚历史会话卡死时，唯一能自带判断的就是"这次发了多大"。
-  // 以前日志里一个字都没有，事后只能靠猜，也就没法证明是体积问题。
+  // 请求体大小一定要记：厚历史会话出问题时，"这次发了多大"是最基本的线索。
+  // 以前日志里一个字都没有，事后只能靠猜，也就没法证明跟体积有没有关系。
   const kb = !state.bytes ? '-' : (state.bytes < 1024 ? state.bytes + 'B' : (state.bytes / 1024).toFixed(0) + 'KB');
+  // 出站当时走的是哪条路也要记。他反馈过「突然连接不上」，
+  // 那种时候最需要回答的是「那一刻代理还在不在、是直连还是走隧道」——
+  // 光看 ERR 码猜不出来。日志里带一个短标记，事后能直接对上。
+  const obMark = OUTBOUND.mode === 'proxy' ? 'ob=proxy' : (OUTBOUND.mode === 'broken' ? 'ob=broken' : 'ob=direct');
   recordEvent({
     at: started, ms, method: req.method, path: req.url,
-    status: state.status ?? 0, injected: state.injected || 0, filled: state.filled || 0, dropped: state.dropped || 0, gzipped: state.gzipped || false, bytes: state.bytes || 0,
+    status: state.status ?? 0, injected: state.injected || 0, cleaned: state.cleaned || 0, dropped: state.dropped || 0, gzipped: state.gzipped || false, bytes: state.bytes || 0,
+    outboundMode: OUTBOUND.mode,
     label: sessionLabels.get(sidKey) || sidKey.slice(0, 8),
     why: aborted ? '客户端断开' : (lastWhy || ''), aborted,
   });
   if (aborted) {
-    console.log(`[${ms}ms] ${req.method} ${req.url} body=${kb} ABORTED-BY-CLIENT (upstream stopped)`);
+    console.log(`[${ms}ms] ${req.method} ${req.url} body=${kb} ${obMark} ABORTED-BY-CLIENT (upstream stopped)`);
   } else {
     const sid = (req.headers['x-wb-session'] || state.session || DEFAULT_SESSION).slice(0, 8);
     // 把状态码写进日志：出问题时"上游回了什么"比"跑了多久"更有用。
-    console.log(`[${ms}ms] ${req.method} ${req.url} session=${sid} body=${kb} status=${state.status ?? '-'}${state.injected ? ` 补思考=${state.injected}` : ''}${state.filled ? ` 占位=${state.filled}` : ''}${state.dropped ? ` 丢空壳=${state.dropped}` : ''}${state.gzipped ? ' gz' : ''}${lastWhy ? ` ERR:${lastWhy}` : ''}`);
+    console.log(`[${ms}ms] ${req.method} ${req.url} session=${sid} body=${kb} ${obMark} status=${state.status ?? '-'}${state.injected ? ` 补思考=${state.injected}` : ''}${state.cleaned ? ` 清占位=${state.cleaned}` : ''}${state.dropped ? ` 丢空壳=${state.dropped}` : ''}${state.gzipped ? ' gz' : ''}${lastWhy ? ` ERR:${lastWhy}` : ''}`);
   }
 }
 
@@ -1295,7 +1335,7 @@ const server = http.createServer((req, res) => {
   if (req.url === '/' || req.url.startsWith('/?')) {
     // 网页看板已砍（2026-10-28 用户令）：状态只在终端看。这里只留一行指路，免得误点浏览器看到空白。
     res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
-    return res.end('OpenCode Go 启动器在跑。状态 JSON：/status   健康检查：/healthz\n');
+    return res.end('OpenCode Go 启动器在跑。\n状态 JSON：/status   健康检查：/healthz   出问题看这里：/diag\n');
   }
   if (req.url === '/status') {
     const lastAt = recent.length ? recent[recent.length - 1].at : 0;
@@ -1316,6 +1356,35 @@ const server = http.createServer((req, res) => {
       cacheSize: reasoningByText.size,
       recent: recent.slice(-RECENT_MAX).reverse(),
     }));
+  }
+  if (req.url === '/diag') {
+    // 「突然连接不上」时，最想知道的是：那一刻代理还在不在、走的哪条路、上游能不能通。
+    // 这个口子只读，不改任何状态；本机回环，外面访问不到。
+    const recentFails = recent.filter((e) => !(e.status >= 200 && e.status < 300) && !e.aborted).slice(-8)
+      .map((e) => ({ at: e.at, ms: e.ms, status: e.status, why: e.why, bytes: e.bytes, ob: e.outboundMode }));
+    return (async () => {
+      // 现场再验一次出站，别看缓存——"现在通不通"比"上次判过"有用
+      const live = await resolveOutbound();
+      res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({
+        version: VERSION,
+        now: new Date().toISOString(),
+        uptimeMin: Math.round((Date.now() - STARTED_AT) / 60000),
+        upstream: UPSTREAM,
+        outboundNow: { mode: live.mode, text: describeOutbound(live), detail: live.detail },
+        outboundInUse: { mode: OUTBOUND.mode, text: describeOutbound(), checkedAt: OUTBOUND.checkedAt },
+        candidates: proxyCandidates().map((c) => ({ where: `${c.host}:${c.port}`, from: c.from })),
+        listening: `${HOST}:${PORT}`,
+        counters: { total: stat.total, ok: stat.ok, fail: stat.fail, repaired: stat.repaired, cleaned: stat.cleaned },
+        inflight: [...inflight.values()].reduce((a, b) => a + b, 0),
+        active: [...activeTasks.values()].map((a) => ({ label: a.label, elapsedSec: Math.round((Date.now() - a.started) / 1000) })),
+        recentFailures: recentFails,
+        hint: '出站两种状态不一样时看 outboundNow：它是刚刚实测的；outboundInUse 是当前实际在用的。',
+      }));
+    })().catch((e) => {
+      res.writeHead(500, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: e.message }));
+    });
   }
   if (req.url === '/healthz') {
     res.writeHead(200, { 'content-type': 'application/json' });
