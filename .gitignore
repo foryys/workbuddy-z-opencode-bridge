@@ -1,10 +1,22 @@
+# ── 运行时产物（含聊天原文，绝不入库）──
 tray.log
 proxy-tray.out
 proxy.log
+proxy.log.*
 proxy-fail-*.json
-__pycache__/
+proxy-fail-摘要-*.md
 tui.hwnd
 reasoning-cache.json
 *.log
+*.log.*
+
+# ── 本机配置与备份（config.json.bak_* 里有旧版本 DPAPI 密文）──
 config.json
+*.bak*
+
+# ── 二进制与本机路径（写着账号名与绝对路径，换台机器就没用）──
+*.lnk
+icon.ico
 icon-16x8.png
+
+__pycache__/
